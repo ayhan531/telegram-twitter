@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,7 +17,7 @@ app.use(express.json({ limit: '10mb' }));
 // Health Check
 // ---------------------------------------------------------------------------
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'online', app: 'OmniSync Social', version: '2.0.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'online', app: 'OmniSync Social', version: '2.1.0', timestamp: new Date().toISOString() });
 });
 
 // ---------------------------------------------------------------------------
@@ -54,13 +55,11 @@ app.post('/api/telegram/send', async (req, res) => {
     let endpoint, payload;
 
     if (mediaUrl) {
-      // Send photo with caption
       endpoint = `https://api.telegram.org/bot${botToken}/sendPhoto`;
-      payload = { chat_id: chatId, photo: mediaUrl, caption: text, parse_mode: 'HTML' };
+      payload = { chat_id: chatId, photo: mediaUrl, caption: text };
     } else {
-      // Send text message
       endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
-      payload = { chat_id: chatId, text, parse_mode: 'HTML' };
+      payload = { chat_id: chatId, text };
     }
 
     const r = await fetch(endpoint, {
@@ -188,7 +187,7 @@ app.post('/api/discord/send', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// TWITTER/X – Send tweet via v2 API (OAuth 1.0a User Context required)
+// TWITTER/X – Send tweet via v2 API (OAuth 1.0a)
 // ---------------------------------------------------------------------------
 app.post('/api/twitter/send', async (req, res) => {
   const { apiKey, apiSecret, accessToken, accessTokenSecret, text } = req.body;
@@ -196,15 +195,19 @@ app.post('/api/twitter/send', async (req, res) => {
     return res.status(400).json({ success: false, error: 'API Key, API Secret, Access Token ve Access Token Secret gerekli.' });
   }
 
-  // Build OAuth 1.0a signature for Twitter v2
   try {
-    const oauth = buildOAuthHeader('POST', 'https://api.twitter.com/2/tweets', {}, apiKey, apiSecret, accessToken, accessTokenSecret);
+    const authHeader = buildOAuthHeader(
+      'POST',
+      'https://api.twitter.com/2/tweets',
+      {},
+      apiKey, apiSecret, accessToken, accessTokenSecret
+    );
 
     const r = await fetch('https://api.twitter.com/2/tweets', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: oauth
+        Authorization: authHeader
       },
       body: JSON.stringify({ text })
     });
@@ -228,33 +231,40 @@ app.post('/api/dispatch', async (req, res) => {
     return res.status(400).json({ success: false, error: 'accounts ve text gerekli.' });
   }
 
+  const base = `${req.protocol}://${req.get('host')}`;
   const results = [];
 
   for (const acc of accounts) {
     try {
       let result;
+      const creds = acc.credentials || {};
+
       if (acc.platform === 'telegram') {
-        const r = await fetch(`${req.protocol}://${req.get('host')}/api/telegram/send`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ botToken: acc.credentials.botToken, chatId: acc.credentials.chatId, text, mediaUrl })
+        const r = await fetch(`${base}/api/telegram/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ botToken: creds.botToken, chatId: creds.chatId, text, mediaUrl })
         });
         result = await r.json();
       } else if (acc.platform === 'whatsapp') {
-        const r = await fetch(`${req.protocol}://${req.get('host')}/api/whatsapp/send`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ accessToken: acc.credentials.accessToken, phoneNumberId: acc.credentials.phoneNumberId, recipientPhone: acc.credentials.recipientPhone, text, mediaUrl })
+        const r = await fetch(`${base}/api/whatsapp/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accessToken: creds.accessToken, phoneNumberId: creds.phoneNumberId, recipientPhone: creds.recipientPhone, text, mediaUrl })
         });
         result = await r.json();
       } else if (acc.platform === 'discord') {
-        const r = await fetch(`${req.protocol}://${req.get('host')}/api/discord/send`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ webhookUrl: acc.credentials.webhookUrl, username: acc.credentials.username, text, mediaUrl })
+        const r = await fetch(`${base}/api/discord/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webhookUrl: creds.webhookUrl, username: creds.username, text, mediaUrl })
         });
         result = await r.json();
       } else if (acc.platform === 'twitter') {
-        const r = await fetch(`${req.protocol}://${req.get('host')}/api/twitter/send`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey: acc.credentials.apiKey, apiSecret: acc.credentials.apiSecret, accessToken: acc.credentials.accessToken, accessTokenSecret: acc.credentials.accessTokenSecret, text })
+        const r = await fetch(`${base}/api/twitter/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey: creds.apiKey, apiSecret: creds.apiSecret, accessToken: creds.accessToken, accessTokenSecret: creds.accessTokenSecret, text })
         });
         result = await r.json();
       } else {
@@ -271,10 +281,10 @@ app.post('/api/dispatch', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// OAuth 1.0a Header Builder for Twitter
+// OAuth 1.0a Header Builder for Twitter  (pure sync – uses top-level crypto)
 // ---------------------------------------------------------------------------
 function buildOAuthHeader(method, url, params, consumerKey, consumerSecret, token, tokenSecret) {
-  const nonce = Math.random().toString(36).substring(2);
+  const nonce = crypto.randomBytes(16).toString('hex');
   const timestamp = Math.floor(Date.now() / 1000).toString();
 
   const oauthParams = {
@@ -287,25 +297,26 @@ function buildOAuthHeader(method, url, params, consumerKey, consumerSecret, toke
   };
 
   const allParams = { ...params, ...oauthParams };
-  const sortedParams = Object.keys(allParams).sort().map(k => `${encode(k)}=${encode(allParams[k])}`).join('&');
-  const baseString = `${method.toUpperCase()}&${encode(url)}&${encode(sortedParams)}`;
-  const signingKey = `${encode(consumerSecret)}&${encode(tokenSecret)}`;
+  const sortedParams = Object.keys(allParams)
+    .sort()
+    .map(k => `${pctEncode(k)}=${pctEncode(allParams[k])}`)
+    .join('&');
 
-  // HMAC-SHA1 using Node crypto
-  const crypto = await import('crypto').catch(() => null);
-  let signature = '';
-  if (crypto) {
-    signature = crypto.default.createHmac('sha1', signingKey).update(baseString).digest('base64');
-  }
+  const baseString = `${method.toUpperCase()}&${pctEncode(url)}&${pctEncode(sortedParams)}`;
+  const signingKey = `${pctEncode(consumerSecret)}&${pctEncode(tokenSecret)}`;
+  const signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
+
   oauthParams.oauth_signature = signature;
 
-  return 'OAuth ' + Object.keys(oauthParams).sort()
-    .map(k => `${encode(k)}="${encode(oauthParams[k])}"`)
+  return 'OAuth ' + Object.keys(oauthParams)
+    .sort()
+    .map(k => `${pctEncode(k)}="${pctEncode(oauthParams[k])}"`)
     .join(', ');
 }
 
-function encode(str) {
-  return encodeURIComponent(String(str)).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+function pctEncode(str) {
+  return encodeURIComponent(String(str))
+    .replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,5 +327,5 @@ app.use(express.static(distPath));
 app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 OmniSync Social running on port ${PORT}`);
+  console.log(`🚀 OmniSync Social v2.1 running on port ${PORT}`);
 });
