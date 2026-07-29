@@ -26,6 +26,12 @@ const tgQRSessions        = new Map();
 const tgActiveSessions    = new Map(); // accountId -> { client, sessionString, accountName }
 const syncRulesStore      = new Map(); // ruleId -> rule object
 const recentlySynced      = new Set(); // messageId -> to prevent double-posting
+const syncLog             = [];        // audit trail for auto-sync attempts (Telegram msg -> Twitter etc.)
+
+function pushSyncLog(entry) {
+  syncLog.unshift({ id: `synclog-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, timestamp: new Date().toLocaleString('tr-TR'), ...entry });
+  if (syncLog.length > 200) syncLog.length = 200;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  HEALTH + CONFIG (tells frontend which services are ready)
@@ -653,13 +659,42 @@ app.delete('/api/sync/rules/:id', (req, res) => {
   return res.json({ success: true });
 });
 
+// Audit trail so the frontend can show WHY an auto-sync attempt succeeded,
+// was filtered, or failed — otherwise those results only ever hit the
+// server console and the user has no way to see them.
+app.get('/api/sync/logs', (_req, res) => {
+  res.json({ success: true, logs: syncLog });
+});
+
 // ─── Execute sync: called when a Telegram message arrives ──────────────────
 async function executeSyncRule(rule, message, twitterAccounts) {
   if (!rule.enabled) return;
 
-  const text = buildTweetText(message.text || message.caption || '', rule);
-  if (!text) return;
+  const rawText = message.text || message.caption || '';
+  const text = buildTweetText(rawText, rule);
+  if (!text) {
+    pushSyncLog({
+      source: `Telegram → ${rule.title}`,
+      messagePreview: (rawText || '(boş mesaj)').slice(0, 80),
+      targets: (twitterAccounts || []).map(a => a.name),
+      status: 'filtered',
+      details: rawText.trim() ? 'Yasaklı kelime filtresine takıldı veya metin boş kaldı.' : 'Mesajda metin yok (sadece medya/diğer).',
+    });
+    return;
+  }
 
+  if (!twitterAccounts?.length) {
+    pushSyncLog({
+      source: `Telegram → ${rule.title}`,
+      messagePreview: text.slice(0, 80),
+      targets: [],
+      status: 'error',
+      details: 'Kuralda hedef hesap seçili değil.',
+    });
+    return;
+  }
+
+  const results = [];
   for (const twAcc of twitterAccounts) {
     try {
       const c = twAcc.credentials || {};
@@ -674,10 +709,21 @@ async function executeSyncRule(rule, message, twitterAccounts) {
       });
       const d = await r.json();
       console.log(`[Sync] Rule "${rule.title}" → Twitter @${twAcc.username}: ${d.success ? '✅' : '❌ ' + d.error}`);
+      results.push({ account: twAcc.name, success: !!d.success, error: d.error });
     } catch (e) {
       console.error('[Sync] Twitter post error:', e.message);
+      results.push({ account: twAcc.name, success: false, error: e.message });
     }
   }
+
+  const failCount = results.filter(r => !r.success).length;
+  pushSyncLog({
+    source: `Telegram → ${rule.title}`,
+    messagePreview: text.slice(0, 80),
+    targets: twitterAccounts.map(a => a.name),
+    status: failCount === 0 ? 'success' : (failCount === results.length ? 'error' : 'partial'),
+    details: results.map(r => `${r.account}: ${r.success ? '✅ gönderildi' : '❌ ' + (r.error || 'bilinmeyen hata')}`).join(' · '),
+  });
 }
 
 function buildTweetText(rawText, rule) {
@@ -731,6 +777,10 @@ async function startTelegramListener(accountId) {
       recentlySynced.add(msgKey);
       setTimeout(() => recentlySynced.delete(msgKey), 60000); // cleanup after 1 min
 
+      // gramjs exposes the internal channelId/chatId (no sign, no -100
+      // prefix), but the UI tells users to paste Telegram's *display* id
+      // (e.g. -1001234567890). Normalize both sides the same way so they
+      // actually compare equal.
       const chatId = msg.peerId?.channelId?.toString() ||
                      msg.peerId?.chatId?.toString() ||
                      msg.peerId?.userId?.toString() || '';
@@ -738,15 +788,29 @@ async function startTelegramListener(accountId) {
 
       console.log(`[Telegram] New message from chatId=${chatId} senderId=${senderId}: ${(msg.text || '').slice(0, 80)}`);
 
-      // Find matching sync rules
-      const matchingRules = [...syncRulesStore.values()].filter(rule => {
-        if (!rule.enabled) return false;
-        if (rule.sourceAccountId !== accountId) return false;
+      const accountRules = [...syncRulesStore.values()].filter(
+        r => r.enabled && r.sourceAccountId === accountId
+      );
 
+      // Only resolve the chat's @username if some rule actually filters by it
+      let chatUsername = null;
+      if (accountRules.some(r => r.sourceChannelId?.trim().startsWith('@'))) {
+        try {
+          const chat = await msg.getChat();
+          chatUsername = (chat?.username || '').toLowerCase();
+        } catch (_) { /* ignore, falls through as no match for @-filters */ }
+      }
+
+      const matchingRules = accountRules.filter(rule => {
         // Channel filter
-        if (rule.sourceChannelId) {
-          const ruleChannelId = rule.sourceChannelId.replace(/[^0-9]/g, '');
-          if (ruleChannelId && chatId !== ruleChannelId) return false;
+        const rawFilter = rule.sourceChannelId?.trim();
+        if (rawFilter) {
+          if (rawFilter.startsWith('@')) {
+            if (rawFilter.slice(1).toLowerCase() !== chatUsername) return false;
+          } else {
+            const ruleChannelId = rawFilter.replace(/^-100/, '').replace(/^-/, '').replace(/[^0-9]/g, '');
+            if (ruleChannelId && chatId !== ruleChannelId) return false;
+          }
         }
 
         // Sender filter
@@ -757,6 +821,10 @@ async function startTelegramListener(accountId) {
 
         return true;
       });
+
+      if (accountRules.length && !matchingRules.length) {
+        console.log(`[Telegram] Message did not match any rule for account ${accountId} (chatId=${chatId}, chatUsername=${chatUsername || '-'})`);
+      }
 
       for (const rule of matchingRules) {
         await executeSyncRule(rule, msg, rule.targetAccounts || []);

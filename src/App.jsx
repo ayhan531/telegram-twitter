@@ -119,6 +119,41 @@ export default function App() {
     }, 3500);
   };
 
+  // ─── Poll the server's sync audit trail so failed/filtered auto-posts
+  // (Telegram message came in but the tweet didn't go out) are actually
+  // visible somewhere, instead of only ever showing up in server console logs.
+  const seenSyncLogIds = useRef(new Set(logs.filter(l => l.id?.startsWith('synclog-')).map(l => l.id)));
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch('/api/sync/logs');
+        const d = await r.json();
+        if (cancelled || !d.success || !d.logs?.length) return;
+
+        const fresh = d.logs.filter(l => !seenSyncLogIds.current.has(l.id));
+        if (!fresh.length) return;
+        fresh.forEach(l => seenSyncLogIds.current.add(l.id));
+
+        setLogs(prev => [...fresh, ...prev].slice(0, 300));
+
+        // Surface only the newest failure/filter as a toast to avoid spamming
+        const problem = fresh.find(l => l.status === 'error' || l.status === 'filtered');
+        if (problem) {
+          showToast(
+            problem.status === 'error'
+              ? `❌ Otomatik gönderim başarısız: ${problem.details || problem.source}`
+              : `⚠️ Mesaj filtrelendi, paylaşılmadı: ${problem.details || ''}`,
+            'error'
+          );
+        }
+      } catch (_) { /* server may be waking up on free tier, ignore */ }
+    };
+    poll();
+    const interval = setInterval(poll, 8000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+
   const handleOpenQuickCompose = () => {
     setActiveTab('composer');
   };
