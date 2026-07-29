@@ -203,7 +203,7 @@ app.get('/api/twitter/oauth/start', (req, res) => {
     response_type: 'code',
     client_id: clientId,
     redirect_uri: redirectUri,
-    scope: 'tweet.read tweet.write users.read offline.access',
+    scope: 'tweet.read tweet.write users.read',
     state,
     code_challenge: codeChallenge,
     code_challenge_method: 'S256',
@@ -217,10 +217,12 @@ app.get('/api/twitter/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
   if (error) {
-    return res.send(`<html><body><script>
-      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'${error}' }, '*');
-      window.close();
-    </script><p>Hata: ${error}. Bu pencere kapanacak...</p></body></html>`);
+    return res.send(`<html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;">
+      <div style="font-size:48px">❌</div>
+      <h2 style="margin:0">Twitter Hata: ${error}</h2>
+      <p style="color:#94a3b8;margin:0">Bu pencereyi kapatıp tekrar dene.</p>
+      <script>window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'${error}' }, '*');</script>
+    </body></html>`);
   }
 
   const session = twitterOAuthSessions.get(state);
