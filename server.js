@@ -272,18 +272,25 @@ app.post('/api/twitter/verify', async (req, res) => {
   }
 });
 
-// Send tweet with OAuth 1.0a
+// Send tweet (supports both OAuth 1.0a and OAuth 2.0 Bearer)
 app.post('/api/twitter/send', async (req, res) => {
   const { consumerKey, consumerSecret, accessToken, accessTokenSecret, text } = req.body;
   if (!text) return res.status(400).json({ success: false, error: 'text gerekli.' });
-  if (!consumerKey || !accessToken)
-    return res.status(400).json({ success: false, error: 'Twitter kimlik bilgileri eksik.' });
+  if (!accessToken) return res.status(400).json({ success: false, error: 'accessToken gerekli.' });
+
   try {
     const url = 'https://api.twitter.com/2/tweets';
-    const auth = buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    let authHeader = '';
+
+    if (consumerKey && consumerSecret && accessTokenSecret) {
+      authHeader = buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    } else {
+      authHeader = `Bearer ${accessToken}`;
+    }
+
     const r = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: auth },
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader },
       body: JSON.stringify({ text }),
     });
     const data = await r.json();
@@ -293,6 +300,106 @@ app.post('/api/twitter/send', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TWITTER ─ OAuth 2.0 PKCE 1-Click Login (Universal for unlimited accounts)
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/twitter/oauth/start', (req, res) => {
+  const clientId     = process.env.TWITTER_CLIENT_ID || 'UXdLRTNQNmxTVW1Fc1pwWVVmVmI6MTpjaQ';
+  const clientSecret = process.env.TWITTER_CLIENT_SECRET;
+
+  const state        = crypto.randomBytes(16).toString('hex');
+  const codeVerifier = crypto.randomBytes(32).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  const redirectUri  = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
+
+  twitterOAuthSessions.set(state, { codeVerifier, clientId, clientSecret, redirectUri });
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: 'tweet.read tweet.write users.read offline.access',
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+  });
+
+  return res.redirect(`https://twitter.com/i/oauth2/authorize?${params}`);
+});
+
+app.get('/api/twitter/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.send(`<html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;">
+      <div style="font-size:48px">❌</div>
+      <h2 style="margin:0">Twitter Yetkilendirme Hatası</h2>
+      <p style="color:#94a3b8;margin:0">${error}</p>
+      <script>window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'${error}' }, '*');</script>
+    </body></html>`);
+  }
+
+  const session = twitterOAuthSessions.get(state);
+  if (!session) {
+    return res.send(`<html><body><script>
+      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'Session süresi doldu.' }, '*');
+      window.close();
+    </script></body></html>`);
+  }
+  twitterOAuthSessions.delete(state);
+
+  try {
+    const { codeVerifier, clientId, clientSecret, redirectUri } = session;
+
+    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+    if (clientSecret) {
+      headers['Authorization'] = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+    }
+
+    const tokenRes = await fetch('https://api.twitter.com/2/oauth2/token', {
+      method: 'POST',
+      headers,
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+        client_id: clientId,
+      }),
+    });
+
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok) throw new Error(tokenData.error_description || JSON.stringify(tokenData));
+
+    // Get user info
+    const userRes = await fetch('https://api.twitter.com/2/users/me?user.fields=name,username', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const userData = await userRes.json();
+    const twitterUser = userData.data || {};
+
+    const payload = JSON.stringify({
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token || '',
+      username: twitterUser.username || 'Twitter',
+      name: twitterUser.name || 'Twitter Hesabı',
+    });
+
+    return res.send(`<html><body><script>
+      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_SUCCESS', payload: ${JSON.stringify(payload)} }, '*');
+      window.close();
+    </script><p style="font-family:sans-serif;text-align:center;padding:40px;color:green;">✅ Twitter hesabı başarıyla bağlandı! Bu pencere kapanıyor...</p></body></html>`);
+  } catch (err) {
+    return res.send(`<html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;">
+      <div style="font-size:48px">❌</div>
+      <h2 style="margin:0">Twitter Bağlantı Hatası</h2>
+      <p style="color:#f43f5e">${err.message}</p>
+      <script>window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:${JSON.stringify(err.message)} }, '*');</script>
+    </body></html>`);
+  }
+});
+
 
 
 

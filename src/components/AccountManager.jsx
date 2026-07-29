@@ -48,17 +48,63 @@ const PLATFORMS = {
   },
 };
 
-// ── Twitter: 4 key form (OAuth 1.0a) ─────────────────────────────────────────
+// ── Twitter: 1-Click OAuth + Manual Key tabs ─────────────────────────────────
 function TwitterPanel({ onSave, onCancel }) {
+  const [mode, setMode] = useState('oauth'); // 'oauth' | 'keys'
+  const [status, setStatus] = useState('idle'); // idle | waiting | loading | done | error
+  const [errorMsg, setErrorMsg] = useState('');
+
+  // 4 keys state for manual mode
   const [consumerKey,       setConsumerKey]       = useState('');
   const [consumerSecret,    setConsumerSecret]    = useState('');
   const [accessToken,       setAccessToken]       = useState('');
   const [accessTokenSecret, setAccessTokenSecret] = useState('');
-  const [status,  setStatus]  = useState('idle');
-  const [errorMsg, setErrorMsg] = useState('');
   const [show, setShow] = useState({ cs: false, ats: false });
 
-  const handleConnect = async () => {
+  // OAuth 2.0 Popup listener
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data?.type === 'TWITTER_AUTH_SUCCESS') {
+        try {
+          const payload = typeof e.data.payload === 'string' ? JSON.parse(e.data.payload) : e.data.payload;
+          setStatus('done');
+          onSave({
+            platform: 'twitter',
+            name: payload.name || payload.username || 'Twitter Hesabı',
+            username: `@${payload.username}`,
+            credentials: {
+              accessToken: payload.accessToken,
+              refreshToken: payload.refreshToken,
+            },
+          });
+        } catch (err) {
+          setStatus('error');
+          setErrorMsg('Token parse hatası: ' + err.message);
+        }
+      } else if (e.data?.type === 'TWITTER_AUTH_ERROR') {
+        setStatus('error');
+        setErrorMsg(e.data.error || 'Twitter yetkilendirme başarısız.');
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, [onSave]);
+
+  const startOAuthLogin = () => {
+    setStatus('waiting');
+    setErrorMsg('');
+    const w = 600, h = 700;
+    const left = window.screenX + (window.innerWidth - w) / 2;
+    const top = window.screenY + (window.innerHeight - h) / 2;
+    const popup = window.open('/api/twitter/oauth/start', 'twitter_login',
+      `width=${w},height=${h},left=${left},top=${top},toolbar=0,menubar=0`);
+    if (!popup || popup.closed) {
+      setStatus('error');
+      setErrorMsg('Popup engellendi! Tarayıcı ayarlarından popup izni verin.');
+    }
+  };
+
+  const handleManualConnect = async () => {
     if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret) {
       setErrorMsg('Tüm 4 alanı doldur.'); return;
     }
@@ -93,67 +139,91 @@ function TwitterPanel({ onSave, onCancel }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center space-x-3">
-        <div className="w-12 h-12 rounded-xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-2xl font-black text-white">𝕏</div>
-        <div>
-          <p className="font-bold text-white text-sm">Twitter / X — API Anahtarları</p>
-          <p className="text-[11px] text-slate-400">developer.twitter.com → Keys and tokens → 4 değeri kopyala.</p>
-        </div>
-      </div>
-
-      <div className="p-3 rounded-xl bg-slate-900 border border-slate-700 text-[11px] text-slate-300 space-y-1 leading-relaxed">
-        <p className="font-bold text-white">📋 Nereden alacaksın?</p>
-        <p><span className="text-sky-400 font-semibold">1.</span> <a href="https://developer.twitter.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline">developer.twitter.com</a> → Uygulaman → <strong>Keys and tokens</strong></p>
-        <p><span className="text-sky-400 font-semibold">2.</span> <strong>Consumer Keys</strong> → <strong>API Key</strong> ve <strong>API Key Secret</strong></p>
-        <p><span className="text-sky-400 font-semibold">3.</span> <strong>Authentication Tokens</strong> → <strong>Access Token</strong> ve <strong>Access Token Secret</strong> (yoksa Generate bas)</p>
-      </div>
-
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key (Consumer Key)</label>
-        <input type="text" value={consumerKey} onChange={e => setConsumerKey(e.target.value.trim())}
-          placeholder="API Key" className="w-full px-3 py-2.5 rounded-xl glass-input text-white text-xs font-mono" />
-      </div>
-
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key Secret (Consumer Secret)</label>
-        <div className="relative">
-          <input type={show.cs ? 'text' : 'password'} value={consumerSecret} onChange={e => setConsumerSecret(e.target.value.trim())}
-            placeholder="API Key Secret" className="w-full px-3 py-2.5 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
-          <button type="button" onClick={() => setShow(p => ({ ...p, cs: !p.cs }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
-            {show.cs ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
-        </div>
-      </div>
-
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token</label>
-        <input type="text" value={accessToken} onChange={e => setAccessToken(e.target.value.trim())}
-          placeholder="Access Token" className="w-full px-3 py-2.5 rounded-xl glass-input text-white text-xs font-mono" />
-      </div>
-
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token Secret</label>
-        <div className="relative">
-          <input type={show.ats ? 'text' : 'password'} value={accessTokenSecret} onChange={e => setAccessTokenSecret(e.target.value.trim())}
-            placeholder="Access Token Secret" className="w-full px-3 py-2.5 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
-          <button type="button" onClick={() => setShow(p => ({ ...p, ats: !p.ats }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
-            {show.ats ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
-        </div>
-      </div>
-
-      {errorMsg && (
-        <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300">{errorMsg}</div>
-      )}
-
-      <div className="flex space-x-3 pt-1">
-        <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-semibold transition border border-slate-700">İptal</button>
-        <button onClick={handleConnect} disabled={status === 'loading'}
-          className="flex-1 py-2.5 rounded-xl bg-neutral-700 hover:bg-neutral-600 border border-neutral-500 text-white text-sm font-bold transition flex items-center justify-center space-x-2">
-          {status === 'loading' ? <Loader2 size={16} className="animate-spin" /> : <span className="font-black text-base">𝕏</span>}
-          <span>{status === 'loading' ? 'Doğrulanıyor...' : 'Bağla ve Doğrula'}</span>
+      {/* Mode switcher tabs */}
+      <div className="flex bg-slate-800/60 p-1 rounded-xl border border-slate-700">
+        <button onClick={() => { setMode('oauth'); setErrorMsg(''); }}
+          className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition ${mode === 'oauth' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          ⚡ Tek Tıkla Giriş (Önerilen)
+        </button>
+        <button onClick={() => { setMode('keys'); setErrorMsg(''); }}
+          className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition ${mode === 'keys' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          🔑 API Key ile Giriş (Manuel)
         </button>
       </div>
+
+      {mode === 'oauth' ? (
+        <div className="flex flex-col items-center space-y-5 py-4">
+          <div className="w-16 h-16 rounded-2xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-3xl font-black text-white shadow-xl">
+            𝕏
+          </div>
+          <div className="text-center space-y-1">
+            <p className="text-sm font-bold text-white">İstediğin Twitter Hesabını 1-Tıkla Bağla</p>
+            <p className="text-xs text-slate-400">Butona bas → Açılan sayfada izin ver → İstediğin kadar hesap ekle!</p>
+          </div>
+
+          {errorMsg && (
+            <div className="w-full p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300 text-center">{errorMsg}</div>
+          )}
+
+          {status === 'idle' || status === 'error' ? (
+            <button onClick={startOAuthLogin}
+              className="w-full max-w-xs py-3.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-neutral-600 text-white text-sm font-bold flex items-center justify-center space-x-3 transition shadow-lg">
+              <span className="text-lg font-black">𝕏</span>
+              <span>Twitter ile Giriş Yap</span>
+            </button>
+          ) : (
+            <div className="flex flex-col items-center space-y-2">
+              <div className="w-full max-w-xs py-3 rounded-xl bg-neutral-900 border border-neutral-700 text-slate-300 text-xs font-semibold flex items-center justify-center space-x-2">
+                <Loader2 size={16} className="animate-spin text-sky-400" />
+                <span>Giriş yapılması bekleniyor...</span>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key (Consumer Key)</label>
+            <input type="text" value={consumerKey} onChange={e => setConsumerKey(e.target.value.trim())}
+              placeholder="API Key" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+          </div>
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key Secret</label>
+            <div className="relative">
+              <input type={show.cs ? 'text' : 'password'} value={consumerSecret} onChange={e => setConsumerSecret(e.target.value.trim())}
+                placeholder="API Key Secret" className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+              <button type="button" onClick={() => setShow(p => ({ ...p, cs: !p.cs }))} className="absolute right-3 top-2 text-slate-400 hover:text-white">
+                {show.cs ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token</label>
+            <input type="text" value={accessToken} onChange={e => setAccessToken(e.target.value.trim())}
+              placeholder="Access Token" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+          </div>
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token Secret</label>
+            <div className="relative">
+              <input type={show.ats ? 'text' : 'password'} value={accessTokenSecret} onChange={e => setAccessTokenSecret(e.target.value.trim())}
+                placeholder="Access Token Secret" className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+              <button type="button" onClick={() => setShow(p => ({ ...p, ats: !p.ats }))} className="absolute right-3 top-2 text-slate-400 hover:text-white">
+                {show.ats ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+          </div>
+
+          {errorMsg && <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300">{errorMsg}</div>}
+
+          <div className="flex space-x-3 pt-1">
+            <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700">İptal</button>
+            <button onClick={handleManualConnect} disabled={status === 'loading'}
+              className="flex-1 py-2.5 rounded-xl bg-neutral-700 hover:bg-neutral-600 border border-neutral-500 text-white text-xs font-bold flex items-center justify-center space-x-2">
+              {status === 'loading' ? <Loader2 size={14} className="animate-spin" /> : <span>Bağla ve Doğrula</span>}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
