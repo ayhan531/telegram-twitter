@@ -48,11 +48,19 @@ const PLATFORMS = {
   },
 };
 
-// ── Twitter: 1-Click OAuth + Manual Key tabs ─────────────────────────────────
+// ── Twitter: Free (cookie) login + 1-Click OAuth + Manual Key tabs ──────────
 function TwitterPanel({ onSave, onCancel }) {
-  const [mode, setMode] = useState('oauth'); // 'keys' | 'oauth'
+  const [mode, setMode] = useState('free'); // 'free' | 'keys' | 'oauth'
   const [status, setStatus] = useState('idle'); // idle | waiting | loading | done | error
   const [errorMsg, setErrorMsg] = useState('');
+
+  // Free login (username + password, no developer account needed)
+  const [twUsername, setTwUsername] = useState('');
+  const [twPassword, setTwPassword] = useState('');
+  const [twEmail, setTwEmail] = useState('');
+  const [twTwoFactor, setTwTwoFactor] = useState('');
+  const [showPw, setShowPw] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   // 4 keys state for manual mode
   const [consumerKey,       setConsumerKey]       = useState('');
@@ -60,6 +68,33 @@ function TwitterPanel({ onSave, onCancel }) {
   const [accessToken,       setAccessToken]       = useState('');
   const [accessTokenSecret, setAccessTokenSecret] = useState('');
   const [show, setShow] = useState({ cs: false, ats: false });
+
+  const handleFreeLogin = async () => {
+    if (!twUsername || !twPassword) { setErrorMsg('Kullanıcı adı ve şifre gerekli.'); return; }
+    setStatus('loading'); setErrorMsg('');
+    try {
+      const r = await fetch('/api/twitter/free-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: twUsername, password: twPassword,
+          email: twEmail || undefined, twoFactorSecret: twTwoFactor || undefined,
+        }),
+      });
+      const d = await r.json();
+      if (!d.success) throw new Error(d.error);
+      setStatus('done');
+      onSave({
+        platform: 'twitter',
+        name: d.user.name || d.user.username,
+        username: `@${d.user.username}`,
+        credentials: { cookies: d.cookies },
+      });
+    } catch (err) {
+      setStatus('error');
+      setErrorMsg(err.message);
+    }
+  };
 
   // OAuth 2.0 Popup listener
   useEffect(() => {
@@ -141,17 +176,70 @@ function TwitterPanel({ onSave, onCancel }) {
     <div className="space-y-4">
       {/* Mode switcher tabs */}
       <div className="flex bg-slate-800/60 p-1 rounded-xl border border-slate-700">
+        <button onClick={() => { setMode('free'); setErrorMsg(''); }}
+          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'free' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          🔓 Ücretsiz Giriş (Önerilen)
+        </button>
         <button onClick={() => { setMode('oauth'); setErrorMsg(''); }}
-          className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition ${mode === 'oauth' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
-          ⚡ Tek Tıkla Giriş (Önerilen)
+          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'oauth' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          ⚡ OAuth
         </button>
         <button onClick={() => { setMode('keys'); setErrorMsg(''); }}
-          className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition ${mode === 'keys' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
-          🔑 API Key ile Giriş (Manuel)
+          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'keys' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          🔑 API Key
         </button>
       </div>
 
-      {mode === 'oauth' ? (
+      {mode === 'free' ? (
+        <div className="space-y-3">
+          <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/20 text-xs text-emerald-200 leading-relaxed">
+            <p className="font-bold text-emerald-300 mb-1">Twitter Developer hesabı / API ücreti YOK.</p>
+            <p>Normal Twitter kullanıcı adı ve şifreni gir, sistem senin adına tarayıcı oturumu açıp otomatik tweet atar. Client ID, API Key, Access Token gibi hiçbir şeyle uğraşmana gerek yok.</p>
+          </div>
+
+          {errorMsg && <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300 leading-relaxed">{errorMsg}</div>}
+
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">Kullanıcı Adı (@olmadan)</label>
+            <input type="text" value={twUsername} onChange={e => setTwUsername(e.target.value.trim())}
+              placeholder="kullaniciadi" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
+          </div>
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">Şifre</label>
+            <div className="relative">
+              <input type={showPw ? 'text' : 'password'} value={twPassword} onChange={e => setTwPassword(e.target.value)}
+                placeholder="Twitter şifren" className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs" />
+              <button type="button" onClick={() => setShowPw(p => !p)} className="absolute right-3 top-2 text-slate-400 hover:text-white">
+                {showPw ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+          </div>
+
+          <button type="button" onClick={() => setShowAdvanced(p => !p)} className="text-[11px] text-sky-400 hover:underline">
+            {showAdvanced ? '▲ Gelişmiş ayarları gizle' : '▼ E-posta / 2FA gerekiyorsa (isteğe bağlı)'}
+          </button>
+
+          {showAdvanced && (
+            <div className="space-y-3 pt-1">
+              <div>
+                <label className="text-[11px] font-bold text-slate-300 block mb-1">E-posta (Twitter e-posta doğrulaması isterse)</label>
+                <input type="email" value={twEmail} onChange={e => setTwEmail(e.target.value.trim())}
+                  placeholder="ornek@mail.com" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
+              </div>
+              <div>
+                <label className="text-[11px] font-bold text-slate-300 block mb-1">2FA Gizli Anahtarı (Authenticator app secret)</label>
+                <input type="text" value={twTwoFactor} onChange={e => setTwTwoFactor(e.target.value.trim())}
+                  placeholder="İki adımlı doğrulama açıksa" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+              </div>
+            </div>
+          )}
+
+          <button onClick={handleFreeLogin} disabled={status === 'loading'}
+            className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm flex items-center justify-center space-x-2 shadow-md transition">
+            {status === 'loading' ? <Loader2 size={16} className="animate-spin" /> : <span>Giriş Yap ve Bağla ✓</span>}
+          </button>
+        </div>
+      ) : mode === 'oauth' ? (
         <div className="flex flex-col items-center space-y-5 py-4">
           <div className="w-16 h-16 rounded-2xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-3xl font-black text-white shadow-xl">
             𝕏

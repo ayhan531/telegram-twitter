@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
+import { Scraper } from 'agent-twitter-client';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -406,6 +407,60 @@ app.get('/api/twitter/callback', async (req, res) => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  TWITTER ─ Free "no developer account" login (username + password → cookies)
+//  Uses Twitter's own web session (like logging in from a browser) instead of
+//  the paid Twitter Developer API. No client id / API key needed at all.
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/twitter/free-login', async (req, res) => {
+  const { username, password, email, twoFactorSecret } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Kullanıcı adı ve şifre gerekli.' });
+  }
+  try {
+    const scraper = new Scraper();
+    await scraper.login(username.trim(), password, email?.trim() || undefined, twoFactorSecret?.trim() || undefined);
+
+    const loggedIn = await scraper.isLoggedIn();
+    if (!loggedIn) throw new Error('Giriş başarısız. Kullanıcı adı/şifreyi kontrol et.');
+
+    const profile = await scraper.me();
+    const cookies = (await scraper.getCookies()).map(c => c.toString());
+
+    return res.json({
+      success: true,
+      user: {
+        username: profile?.username || username.trim(),
+        name: profile?.name || profile?.username || username.trim(),
+      },
+      cookies,
+    });
+  } catch (err) {
+    let msg = err.message || 'Giriş başarısız.';
+    if (/acid|arkose|challenge/i.test(msg)) msg = 'Twitter ek doğrulama istiyor. Birkaç dakika sonra tekrar dene veya tarayıcıdan bir kez giriş yaparak hesabı ısındır.';
+    return res.status(400).json({ success: false, error: msg });
+  }
+});
+
+// Send a tweet using stored session cookies (no API keys involved)
+app.post('/api/twitter/free-send', async (req, res) => {
+  const { cookies, text } = req.body;
+  if (!cookies?.length || !text) return res.status(400).json({ success: false, error: 'cookies ve text gerekli.' });
+  try {
+    const scraper = new Scraper();
+    await scraper.setCookies(cookies);
+    const result = await scraper.sendTweet(text);
+    let data = {};
+    try { data = await result.json(); } catch (_) {}
+    const tweetId = data?.data?.create_tweet?.tweet_results?.result?.rest_id;
+    const errMsg = data?.errors?.[0]?.message;
+    if (errMsg) return res.status(400).json({ success: false, error: errMsg });
+    return res.json({ success: true, tweetId: tweetId || null });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  WHATSAPP ─ Send
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/api/whatsapp/send', async (req, res) => {
@@ -479,8 +534,13 @@ app.post('/api/dispatch', async (req, res) => {
         r = await fetch(`${base}/api/telegram/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken: c.botToken, chatId: c.chatId, text, mediaUrl }) });
         result = await r.json();
       } else if (acc.platform === 'twitter') {
-        // OAuth 1.0a: use consumerKey + accessToken
-        r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, text }) });
+        if (c.cookies?.length) {
+          // Free cookie-session login (no developer API)
+          r = await fetch(`${base}/api/twitter/free-send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cookies: c.cookies, text }) });
+        } else {
+          // OAuth 1.0a: use consumerKey + accessToken, or OAuth2 bearer accessToken
+          r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, text }) });
+        }
         result = await r.json();
       } else if (acc.platform === 'whatsapp') {
         r = await fetch(`${base}/api/whatsapp/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessToken: c.accessToken, phoneNumberId: c.phoneNumberId, recipientPhone: c.recipientPhone, text, mediaUrl }) });
@@ -551,10 +611,15 @@ async function executeSyncRule(rule, message, twitterAccounts) {
 
   for (const twAcc of twitterAccounts) {
     try {
-      const r = await fetch(`http://localhost:${PORT}/api/twitter/send`, {
+      const c = twAcc.credentials || {};
+      const endpoint = c.cookies?.length ? 'free-send' : 'send';
+      const body = c.cookies?.length
+        ? { cookies: c.cookies, text }
+        : { consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, text };
+      const r = await fetch(`http://localhost:${PORT}/api/twitter/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accessToken: twAcc.credentials?.accessToken, text }),
+        body: JSON.stringify(body),
       });
       const d = await r.json();
       console.log(`[Sync] Rule "${rule.title}" → Twitter @${twAcc.username}: ${d.success ? '✅' : '❌ ' + d.error}`);

@@ -11,6 +11,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "agent-twitter-client": "^0.0.18",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "lucide-react": "^0.344.0",

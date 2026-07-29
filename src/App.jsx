@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Navbar from './components/Navbar';
 import Sidebar from './components/Sidebar';
 import Dashboard from './components/Dashboard';
@@ -58,6 +58,59 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // ─── n8n-style auto-automation: the moment a Telegram account AND at least
+  // one target account (Twitter, WhatsApp, Discord...) are both connected,
+  // automatically create/update a "connect everything" sync rule so the user
+  // never has to configure anything by hand — just log in and it runs.
+  const autoRuleSignature = useRef('');
+  useEffect(() => {
+    const telegramAccounts = accounts.filter(a => a.platform === 'telegram');
+    const targetAccounts = accounts.filter(a => a.platform !== 'telegram');
+    if (telegramAccounts.length === 0 || targetAccounts.length === 0) return;
+
+    const signature = JSON.stringify({
+      tg: telegramAccounts.map(a => a.id),
+      targets: targetAccounts.map(a => a.id),
+    });
+    if (signature === autoRuleSignature.current) return;
+    autoRuleSignature.current = signature;
+
+    telegramAccounts.forEach(tgAcc => {
+      const sourceAccountId = tgAcc.credentials?.accountId || tgAcc.id;
+      const autoRuleId = `auto-${sourceAccountId}`;
+      const existing = rules.find(r => r.id === autoRuleId);
+
+      const rule = {
+        id: autoRuleId,
+        title: `Otomatik: ${tgAcc.name} → Bağlı Hesaplar`,
+        sourceAccountId,
+        sourceChannelId: existing?.sourceChannelId || '',
+        allowedSenders: existing?.allowedSenders || '',
+        targetIds: targetAccounts.map(a => a.id),
+        targetAccounts,
+        autoHashtags: existing?.autoHashtags || '',
+        bannedKeywords: existing?.bannedKeywords || '',
+        forwardMedia: existing?.forwardMedia ?? false,
+        enabled: existing?.enabled ?? true,
+      };
+
+      fetch('/api/sync/rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rule),
+      }).catch(() => {});
+
+      setRules(prev => {
+        const idx = prev.findIndex(r => r.id === autoRuleId);
+        if (idx >= 0) { const n = [...prev]; n[idx] = rule; return n; }
+        return [...prev, rule];
+      });
+
+      if (!existing) {
+        showToast('⚡ Otomasyon kuruldu! Artık Telegram mesajların otomatik paylaşılacak.', 'success');
+      }
+    });
+  }, [accounts]);
 
   const showToast = (message, type = 'info') => {
     setToast({ visible: true, message, type });
