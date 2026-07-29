@@ -418,13 +418,23 @@ app.post('/api/twitter/free-login', async (req, res) => {
   }
   try {
     const scraper = new Scraper();
+    // login() itself throws if the credentials are wrong or a subtask fails,
+    // so a clean resolve here means the session cookies are valid. We
+    // deliberately avoid isLoggedIn()/me() — they call the deprecated
+    // v1.1 verify_credentials endpoint, which X now returns "page does not
+    // exist" (code 34) for on this auth flow even with a valid session.
     await scraper.login(username.trim(), password, email?.trim() || undefined, twoFactorSecret?.trim() || undefined);
 
-    const loggedIn = await scraper.isLoggedIn();
-    if (!loggedIn) throw new Error('Giriş başarısız. Kullanıcı adı/şifreyi kontrol et.');
-
-    const profile = await scraper.me();
     const cookies = (await scraper.getCookies()).map(c => c.toString());
+    if (!cookies.some(c => /^auth_token=/.test(c))) {
+      throw new Error('Giriş başarısız. Kullanıcı adı/şifreyi kontrol et.');
+    }
+
+    let profile = null;
+    try {
+      const profileRes = await scraper.getProfile(username.trim());
+      profile = profileRes || null;
+    } catch (_) { /* profile lookup is best-effort, cookies are what matter */ }
 
     return res.json({
       success: true,
