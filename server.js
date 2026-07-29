@@ -19,22 +19,31 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ─── In-memory stores ────────────────────────────────────────────────────────
-const twitterOAuthSessions = new Map(); // state -> { codeVerifier, clientId, clientSecret, accountName, redirectUri }
-const tgQRSessions = new Map();         // sessionId -> { status, qrDataUrl, sessionString, user, error, client }
+const twitterOAuthSessions = new Map();
+const tgQRSessions        = new Map();
+const tgActiveSessions    = new Map(); // accountId -> { client, sessionString, accountName }
+const syncRulesStore      = new Map(); // ruleId -> rule object
+const recentlySynced      = new Set(); // messageId -> to prevent double-posting
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  HEALTH + CONFIG (tells frontend which services are ready)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'online', app: 'OmniSync Social', version: '3.1.0' });
+  res.json({ status: 'online', app: 'OmniSync Social', version: '3.2.0' });
 });
 
-// Frontend calls this to know which one-click logins are available
 app.get('/api/config', (_req, res) => {
   res.json({
-    twitterReady: !!(process.env.TWITTER_CLIENT_ID && process.env.TWITTER_CLIENT_SECRET),
-    telegramReady: !!(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH),
+    twitterReady:  !!(process.env.TWITTER_CLIENT_ID && process.env.TWITTER_CLIENT_SECRET),
+    telegramReady: !!(process.env.TELEGRAM_API_ID  && process.env.TELEGRAM_API_HASH),
+    callbackUrl:   `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'telegram-twitter.onrender.com'}/api/twitter/callback`,
   });
+});
+
+// Debug: show exact callback URL we use (helps user verify in Twitter portal)
+app.get('/api/twitter/callback-url', (req, res) => {
+  const url = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
+  res.json({ callbackUrl: url, hint: 'Bu URL Twitter Developer Portal > App > Settings > Callback URI alanında birebir kayıtlı olmalı.' });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -410,10 +419,177 @@ app.post('/api/dispatch', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  TELEGRAM SESSION STORE (frontend pushes session after QR login)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Store a Telegram user session on the server so we can listen to messages
+app.post('/api/telegram/session/store', (req, res) => {
+  const { accountId, accountName, sessionString, apiId, apiHash } = req.body;
+  if (!accountId || !sessionString) return res.status(400).json({ success: false, error: 'accountId ve sessionString gerekli.' });
+  tgActiveSessions.set(accountId, { accountId, accountName, sessionString, apiId, apiHash, client: null });
+  return res.json({ success: true, message: 'Oturum sunucuya kaydedildi.' });
+});
+
+app.get('/api/telegram/session/list', (_req, res) => {
+  const list = [...tgActiveSessions.entries()].map(([id, s]) => ({
+    accountId: id,
+    accountName: s.accountName,
+    connected: !!s.client,
+  }));
+  res.json({ success: true, sessions: list });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SYNC RULES ENGINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.get('/api/sync/rules', (_req, res) => {
+  res.json({ success: true, rules: [...syncRulesStore.values()] });
+});
+
+app.post('/api/sync/rules', (req, res) => {
+  const rule = req.body;
+  if (!rule?.id) return res.status(400).json({ success: false, error: 'rule.id gerekli.' });
+  syncRulesStore.set(rule.id, { ...rule, enabled: rule.enabled !== false });
+  return res.json({ success: true });
+});
+
+app.delete('/api/sync/rules/:id', (req, res) => {
+  syncRulesStore.delete(req.params.id);
+  return res.json({ success: true });
+});
+
+// ─── Execute sync: called when a Telegram message arrives ──────────────────
+async function executeSyncRule(rule, message, twitterAccounts) {
+  if (!rule.enabled) return;
+
+  const text = buildTweetText(message.text || message.caption || '', rule);
+  if (!text) return;
+
+  for (const twAcc of twitterAccounts) {
+    try {
+      const r = await fetch(`http://localhost:${PORT}/api/twitter/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessToken: twAcc.credentials?.accessToken, text }),
+      });
+      const d = await r.json();
+      console.log(`[Sync] Rule "${rule.title}" → Twitter @${twAcc.username}: ${d.success ? '✅' : '❌ ' + d.error}`);
+    } catch (e) {
+      console.error('[Sync] Twitter post error:', e.message);
+    }
+  }
+}
+
+function buildTweetText(rawText, rule) {
+  let text = rawText.trim();
+  if (!text) return '';
+
+  // Banned keywords filter
+  if (rule.bannedKeywords) {
+    const banned = rule.bannedKeywords.split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+    if (banned.some(k => text.toLowerCase().includes(k))) return '';
+  }
+
+  // Max 280 chars for tweets
+  if (text.length > 270) text = text.slice(0, 267) + '...';
+
+  // Auto hashtags
+  if (rule.autoHashtags) {
+    const tags = rule.autoHashtags.split(',').map(t => t.trim().replace(/^#?/, '#')).filter(Boolean).join(' ');
+    if (text.length + tags.length + 1 <= 280) text += '\n' + tags;
+  }
+
+  return text;
+}
+
+// ─── Start Telegram listener for an account ────────────────────────────────
+async function startTelegramListener(accountId) {
+  const sess = tgActiveSessions.get(accountId);
+  if (!sess || sess.client) return; // already running
+
+  try {
+    const { TelegramClient } = await import('teleproto');
+    const { StringSession } = await import('teleproto/sessions/index.js');
+    const { NewMessage } = await import('teleproto/events/index.js');
+
+    const client = new TelegramClient(
+      new StringSession(sess.sessionString),
+      parseInt(sess.apiId || process.env.TELEGRAM_API_ID, 10),
+      sess.apiHash || process.env.TELEGRAM_API_HASH,
+      { connectionRetries: 5, useWSS: true }
+    );
+    await client.connect();
+    sess.client = client;
+    console.log(`[Telegram] Listener started for account ${accountId}`);
+
+    client.addEventHandler(async (event) => {
+      const msg = event.message;
+      if (!msg) return;
+
+      const msgKey = `${accountId}:${msg.id}`;
+      if (recentlySynced.has(msgKey)) return;
+      recentlySynced.add(msgKey);
+      setTimeout(() => recentlySynced.delete(msgKey), 60000); // cleanup after 1 min
+
+      const chatId = msg.peerId?.channelId?.toString() ||
+                     msg.peerId?.chatId?.toString() ||
+                     msg.peerId?.userId?.toString() || '';
+      const senderId = msg.fromId?.userId?.toString() || '';
+
+      console.log(`[Telegram] New message from chatId=${chatId} senderId=${senderId}: ${(msg.text || '').slice(0, 80)}`);
+
+      // Find matching sync rules
+      const matchingRules = [...syncRulesStore.values()].filter(rule => {
+        if (!rule.enabled) return false;
+        if (rule.sourceAccountId !== accountId) return false;
+
+        // Channel filter
+        if (rule.sourceChannelId) {
+          const ruleChannelId = rule.sourceChannelId.replace(/[^0-9]/g, '');
+          if (ruleChannelId && chatId !== ruleChannelId) return false;
+        }
+
+        // Sender filter
+        if (rule.allowedSenders?.trim()) {
+          const allowed = rule.allowedSenders.split(',').map(s => s.trim()).filter(Boolean);
+          if (!allowed.includes(senderId) && !allowed.includes(msg.sender?.username)) return false;
+        }
+
+        return true;
+      });
+
+      for (const rule of matchingRules) {
+        await executeSyncRule(rule, msg, rule.targetAccounts || []);
+      }
+    }, new NewMessage({}));
+
+  } catch (e) {
+    console.error(`[Telegram] Listener error for ${accountId}:`, e.message);
+  }
+}
+
+app.post('/api/telegram/session/start-listener', async (req, res) => {
+  const { accountId } = req.body;
+  if (!tgActiveSessions.has(accountId)) return res.status(404).json({ success: false, error: 'Oturum bulunamadı.' });
+  startTelegramListener(accountId);
+  return res.json({ success: true, message: 'Dinleyici başlatıldı.' });
+});
+
+// ─── Manual trigger endpoint (for testing) ────────────────────────────────
+app.post('/api/sync/test', async (req, res) => {
+  const { ruleId, text } = req.body;
+  const rule = syncRulesStore.get(ruleId);
+  if (!rule) return res.status(404).json({ success: false, error: 'Kural bulunamadı.' });
+  await executeSyncRule(rule, { text }, rule.targetAccounts || []);
+  res.json({ success: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Static frontend
 // ═══════════════════════════════════════════════════════════════════════════
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
 app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 OmniSync Social v3.0 port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 OmniSync Social v3.2 port ${PORT}`));

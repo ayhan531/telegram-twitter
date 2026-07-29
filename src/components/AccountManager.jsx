@@ -243,11 +243,39 @@ function TelegramPanel({ onSave }) {
           clearInterval(pollRef.current);
           setUser(data.user);
           setStep('done');
+
+          const accountId = `tg-${data.user?.id || Date.now()}`;
+          const accountName = `${data.user?.firstName || ''} ${data.user?.lastName || ''}`.trim() || 'Telegram';
+
+          // Push session to server so the listener can start
+          fetch('/api/telegram/session/store', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              accountId,
+              accountName,
+              sessionString: data.sessionString,
+              apiId: apiId || '',
+              apiHash: apiHash || '',
+            }),
+          }).then(() =>
+            // Auto-start listener
+            fetch('/api/telegram/session/start-listener', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ accountId }),
+            })
+          ).catch(console.error);
+
           onSave({
             platform: 'telegram',
-            name: `${data.user?.firstName || ''} ${data.user?.lastName || ''}`.trim() || 'Telegram',
+            name: accountName,
             username: data.user?.username ? `@${data.user.username}` : data.user?.phone || '',
-            credentials: { sessionString: data.sessionString, userId: data.user?.id },
+            credentials: {
+              sessionString: data.sessionString,
+              userId: data.user?.id,
+              accountId,  // store so SyncRules can reference it
+            },
           });
         } else if (data.status === 'error') {
           clearInterval(pollRef.current);
@@ -257,6 +285,7 @@ function TelegramPanel({ onSave }) {
       } catch (_) {}
     }, 2000);
   };
+
 
   if (step === 'check') return (
     <div className="flex items-center justify-center py-12"><Loader2 size={24} className="animate-spin text-sky-400" /></div>
