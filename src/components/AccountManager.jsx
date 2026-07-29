@@ -11,8 +11,8 @@ const PLATFORMS = {
     emoji: '𝕏',
     bg: 'bg-neutral-800',
     border: 'border-neutral-600/40',
-    authType: 'oauth2',
-    tagline: 'Giriş sayfası açılır, kullanıcı adı+şifreni gir.',
+    authType: 'keys',
+    tagline: 'API Key ve Access Token kopyala-yapıştır.',
   },
   telegram: {
     label: 'Telegram',
@@ -48,146 +48,112 @@ const PLATFORMS = {
   },
 };
 
-// ── Twitter: just one button, no inputs ─────────────────────────────────────
+// ── Twitter: 4 key form (OAuth 1.0a) ─────────────────────────────────────────
 function TwitterPanel({ onSave, onCancel }) {
-  const [status, setStatus] = useState('idle'); // idle | waiting | done | error
+  const [consumerKey,       setConsumerKey]       = useState('');
+  const [consumerSecret,    setConsumerSecret]    = useState('');
+  const [accessToken,       setAccessToken]       = useState('');
+  const [accessTokenSecret, setAccessTokenSecret] = useState('');
+  const [status,  setStatus]  = useState('idle');
   const [errorMsg, setErrorMsg] = useState('');
-  const [serverReady, setServerReady] = useState(null); // null=loading, true, false
+  const [show, setShow] = useState({ cs: false, ats: false });
 
-  useEffect(() => {
-    fetch('/api/config')
-      .then(r => r.json())
-      .then(d => setServerReady(d.twitterReady))
-      .catch(() => setServerReady(false));
-  }, []);
-
-  // Listen for OAuth callback from popup
-  useEffect(() => {
-    const handler = (e) => {
-      if (e.data?.type === 'TWITTER_AUTH_SUCCESS') {
-        try {
-          const payload = JSON.parse(e.data.payload);
-          setStatus('done');
-          onSave({
-            platform: 'twitter',
-            name: payload.name || payload.username || 'Twitter Hesabı',
-            username: `@${payload.username}`,
-            isVerified: false,
-            credentials: {
-              accessToken: payload.accessToken,
-              refreshToken: payload.refreshToken,
-              clientId: payload.clientId,
-              username: payload.username,
-            },
-          });
-        } catch (err) {
-          setStatus('error');
-          setErrorMsg('Token parse hatası: ' + err.message);
-        }
-      } else if (e.data?.type === 'TWITTER_AUTH_ERROR') {
-        setStatus('error');
-        setErrorMsg(e.data.error || 'Twitter yetkilendirme başarısız.');
-      }
-    };
-    window.addEventListener('message', handler);
-    return () => window.removeEventListener('message', handler);
-  }, [onSave]);
-
-  const startLogin = () => {
-    setStatus('waiting');
-    setErrorMsg('');
-    const w = 600, h = 700;
-    const left = window.screenX + (window.innerWidth - w) / 2;
-    const top = window.screenY + (window.innerHeight - h) / 2;
-    const popup = window.open('/api/twitter/oauth/start', 'twitter_login',
-      `width=${w},height=${h},left=${left},top=${top},toolbar=0,menubar=0`);
-    if (!popup || popup.closed) {
+  const handleConnect = async () => {
+    if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret) {
+      setErrorMsg('Tüm 4 alanı doldur.'); return;
+    }
+    setStatus('loading'); setErrorMsg('');
+    try {
+      const r = await fetch('/api/twitter/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ consumerKey, consumerSecret, accessToken, accessTokenSecret }),
+      });
+      const d = await r.json();
+      if (!d.success) throw new Error(d.error);
+      setStatus('done');
+      onSave({
+        platform: 'twitter',
+        name: d.user.name || d.user.username || 'Twitter Hesabı',
+        username: `@${d.user.username}`,
+        credentials: { consumerKey, consumerSecret, accessToken, accessTokenSecret },
+      });
+    } catch (err) {
       setStatus('error');
-      setErrorMsg('Popup engellendi! Tarayıcı ayarlarından bu site için popup\'lara izin verin, sonra tekrar deneyin.');
+      setErrorMsg(err.message);
     }
   };
 
-  if (serverReady === null) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 size={24} className="animate-spin text-indigo-400" />
-      </div>
-    );
-  }
+  if (status === 'done') return (
+    <div className="flex flex-col items-center space-y-3 py-8">
+      <div className="w-16 h-16 rounded-2xl bg-neutral-800 flex items-center justify-center text-3xl font-black text-white">𝕏</div>
+      <div className="flex items-center space-x-2 text-emerald-400 font-bold"><CheckCircle2 size={18} /><span>Twitter hesabı bağlandı! ✅</span></div>
+    </div>
+  );
 
-  if (!serverReady) {
-    return (
-      <div className="space-y-4">
-        <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-500/30 space-y-2">
-          <div className="flex items-center space-x-2 text-amber-300 font-bold text-sm">
-            <AlertTriangle size={16} />
-            <span>Sunucu Yapılandırması Gerekli (Bir Kez)</span>
-          </div>
-          <p className="text-xs text-amber-200/80 leading-relaxed">
-            Twitter girişi için Render'da iki ortam değişkeni ayarlamanız gerekiyor. Bu sadece bir kez yapılır. Sonrasında kullanıcılar sadece butona basarak giriş yapar.
-          </p>
-        </div>
-
-        <div className="space-y-3 text-xs">
-          {[
-            { n: 1, t: 'Twitter Developer Portal', b: 'developer.twitter.com adresine git → Free hesap aç (Twitter hesabınla giriş yap).' },
-            { n: 2, t: 'Uygulama Oluştur', b: '"+ Add App" → İsim ver → "Keys and tokens" bölümüne git.\nSettings → "User authentication settings" → OAuth 2.0 → Enable\nType: "Web App"\nCallback URL: https://telegram-twitter.onrender.com/api/twitter/callback\nWebsite URL: https://telegram-twitter.onrender.com' },
-            { n: 3, t: 'Render\'a Ekle', b: 'Render Dashboard → telegram-twitter servisi → "Environment" sekmesi → şu iki değişkeni ekle:\n\nTWITTER_CLIENT_ID = (Client ID\'yi yapıştır)\nTWITTER_CLIENT_SECRET = (Client Secret\'ı yapıştır)\n\nArdından servisi yeniden başlat.' },
-            { n: 4, t: 'Bitti!', b: 'Bundan sonra bu sayfaya geldiğinde sadece "Twitter ile Giriş Yap" butonunu göreceksin. Client ID falan sormayacak.' },
-          ].map(s => (
-            <div key={s.n} className="flex space-x-3">
-              <div className="w-5 h-5 rounded-full bg-neutral-700 text-white text-[10px] font-bold flex items-center justify-center shrink-0 mt-0.5">{s.n}</div>
-              <div>
-                <p className="font-semibold text-white">{s.t}</p>
-                <p className="text-slate-400 whitespace-pre-line leading-relaxed mt-0.5">{s.b}</p>
-              </div>
-            </div>
-          ))}
-          <a href="https://developer.twitter.com/en/portal" target="_blank" rel="noopener noreferrer"
-            className="inline-flex items-center space-x-1 text-[11px] text-sky-400 hover:underline mt-1">
-            <ExternalLink size={11} /><span>developer.twitter.com →</span>
-          </a>
-        </div>
-      </div>
-    );
-  }
-
-  // Server is ready → show login button
   return (
-    <div className="flex flex-col items-center space-y-5 py-4">
-      <div className="w-20 h-20 rounded-2xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-4xl font-black text-white shadow-xl">
-        𝕏
+    <div className="space-y-4">
+      <div className="flex items-center space-x-3">
+        <div className="w-12 h-12 rounded-xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-2xl font-black text-white">𝕏</div>
+        <div>
+          <p className="font-bold text-white text-sm">Twitter / X — API Anahtarları</p>
+          <p className="text-[11px] text-slate-400">developer.twitter.com → Keys and tokens → 4 değeri kopyala.</p>
+        </div>
       </div>
-      <div className="text-center space-y-1">
-        <p className="text-base font-bold text-white">Twitter Hesabına Giriş Yap</p>
-        <p className="text-xs text-slate-400">Butona bastığında Twitter giriş sayfası açılır.</p>
-        <p className="text-xs text-slate-400">Kullanıcı adın ve şifreni Twitter'da gir → İzin ver → Bitti.</p>
+
+      <div className="p-3 rounded-xl bg-slate-900 border border-slate-700 text-[11px] text-slate-300 space-y-1 leading-relaxed">
+        <p className="font-bold text-white">📋 Nereden alacaksın?</p>
+        <p><span className="text-sky-400 font-semibold">1.</span> <a href="https://developer.twitter.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline">developer.twitter.com</a> → Uygulaman → <strong>Keys and tokens</strong></p>
+        <p><span className="text-sky-400 font-semibold">2.</span> <strong>Consumer Keys</strong> → <strong>API Key</strong> ve <strong>API Key Secret</strong></p>
+        <p><span className="text-sky-400 font-semibold">3.</span> <strong>Authentication Tokens</strong> → <strong>Access Token</strong> ve <strong>Access Token Secret</strong> (yoksa Generate bas)</p>
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key (Consumer Key)</label>
+        <input type="text" value={consumerKey} onChange={e => setConsumerKey(e.target.value.trim())}
+          placeholder="API Key" className="w-full px-3 py-2.5 rounded-xl glass-input text-white text-xs font-mono" />
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key Secret (Consumer Secret)</label>
+        <div className="relative">
+          <input type={show.cs ? 'text' : 'password'} value={consumerSecret} onChange={e => setConsumerSecret(e.target.value.trim())}
+            placeholder="API Key Secret" className="w-full px-3 py-2.5 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+          <button type="button" onClick={() => setShow(p => ({ ...p, cs: !p.cs }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
+            {show.cs ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token</label>
+        <input type="text" value={accessToken} onChange={e => setAccessToken(e.target.value.trim())}
+          placeholder="Access Token" className="w-full px-3 py-2.5 rounded-xl glass-input text-white text-xs font-mono" />
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token Secret</label>
+        <div className="relative">
+          <input type={show.ats ? 'text' : 'password'} value={accessTokenSecret} onChange={e => setAccessTokenSecret(e.target.value.trim())}
+            placeholder="Access Token Secret" className="w-full px-3 py-2.5 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+          <button type="button" onClick={() => setShow(p => ({ ...p, ats: !p.ats }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
+            {show.ats ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
       </div>
 
       {errorMsg && (
-        <div className="w-full p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300 text-center">{errorMsg}</div>
+        <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300">{errorMsg}</div>
       )}
 
-      {status === 'idle' || status === 'error' ? (
-        <button onClick={startLogin}
-          className="w-full max-w-xs py-3.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-neutral-600 text-white text-base font-bold flex items-center justify-center space-x-3 transition shadow-lg">
-          <span className="text-xl font-black">𝕏</span>
-          <span>Twitter ile Giriş Yap</span>
+      <div className="flex space-x-3 pt-1">
+        <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-semibold transition border border-slate-700">İptal</button>
+        <button onClick={handleConnect} disabled={status === 'loading'}
+          className="flex-1 py-2.5 rounded-xl bg-neutral-700 hover:bg-neutral-600 border border-neutral-500 text-white text-sm font-bold transition flex items-center justify-center space-x-2">
+          {status === 'loading' ? <Loader2 size={16} className="animate-spin" /> : <span className="font-black text-base">𝕏</span>}
+          <span>{status === 'loading' ? 'Doğrulanıyor...' : 'Bağla ve Doğrula'}</span>
         </button>
-      ) : status === 'waiting' ? (
-        <div className="flex flex-col items-center space-y-3">
-          <div className="w-full max-w-xs py-3.5 rounded-xl bg-neutral-900 border border-neutral-700 text-slate-300 text-sm font-semibold flex items-center justify-center space-x-2">
-            <Loader2 size={16} className="animate-spin" />
-            <span>Twitter sayfasında giriş bekleniyor...</span>
-          </div>
-          <p className="text-[11px] text-slate-500">Açılan pencerede Twitter bilgilerini gir ve izin ver.</p>
-        </div>
-      ) : (
-        <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
-          <CheckCircle2 size={18} />
-          <span>Twitter hesabı başarıyla bağlandı!</span>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -573,7 +539,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                 <button onClick={() => setWizardStep(1)} className="flex items-center space-x-1 text-xs text-slate-400 hover:text-white mb-5 transition">
                   <ChevronLeft size={15} /><span>Geri</span>
                 </button>
-                {cfg?.authType === 'oauth2' && <TwitterPanel onSave={handleSave} onCancel={closeWizard} />}
+                {(cfg?.authType === 'oauth2' || cfg?.authType === 'keys') && <TwitterPanel onSave={handleSave} onCancel={closeWizard} />}
                 {cfg?.authType === 'qr' && <TelegramPanel onSave={handleSave} />}
                 {(cfg?.authType === 'token' || cfg?.authType === 'webhook') && (
                   <TokenPanel platform={selectedPlatform} onSave={(d) => { handleSave(d); }} onShowToast={onShowToast} />

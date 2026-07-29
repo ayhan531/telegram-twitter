@@ -34,17 +34,10 @@ app.get('/api/health', (_req, res) => {
 
 app.get('/api/config', (_req, res) => {
   res.json({
-    twitterReady:  !!(process.env.TWITTER_CLIENT_ID && process.env.TWITTER_CLIENT_SECRET),
-    telegramReady: !!(process.env.TELEGRAM_API_ID  && process.env.TELEGRAM_API_HASH),
-    callbackUrl:   `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'telegram-twitter.onrender.com'}/api/twitter/callback`,
+    telegramReady: !!(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH),
   });
 });
 
-// Debug: show exact callback URL we use (helps user verify in Twitter portal)
-app.get('/api/twitter/callback-url', (req, res) => {
-  const url = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
-  res.json({ callbackUrl: url, hint: 'Bu URL Twitter Developer Portal > App > Settings > Callback URI alanında birebir kayıtlı olmalı.' });
-});
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TELEGRAM ─ BOT API (test + send)
@@ -179,141 +172,65 @@ app.get('/api/telegram/qr/poll', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ OAuth 2.0 PKCE  (credentials come from server env vars)
+//  TWITTER ─ OAuth 1.0a (API Key + Access Token — no redirect needed)
 // ═══════════════════════════════════════════════════════════════════════════
-app.get('/api/twitter/oauth/start', (req, res) => {
-  const clientId     = process.env.TWITTER_CLIENT_ID;
-  const clientSecret = process.env.TWITTER_CLIENT_SECRET;
 
-  if (!clientId || !clientSecret) {
-    return res.status(503).json({
-      success: false,
-      error: 'Sunucuda TWITTER_CLIENT_ID ve TWITTER_CLIENT_SECRET ortam değişkenleri ayarlanmamış. Render → Environment bölümünden ekleyin.'
-    });
-  }
+// Build OAuth 1.0a Authorization header
+function buildOAuth1Header(method, url, consumerKey, consumerSecret, accessToken, accessTokenSecret) {
+  const oauthParams = {
+    oauth_consumer_key:     consumerKey,
+    oauth_nonce:            crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp:        Math.floor(Date.now() / 1000).toString(),
+    oauth_token:            accessToken,
+    oauth_version:          '1.0',
+  };
 
-  const state        = crypto.randomBytes(16).toString('hex');
-  const codeVerifier = crypto.randomBytes(32).toString('base64url');
-  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-  const redirectUri  = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
+  // Signature base string (no JSON body params — only URL + oauth params)
+  const paramString = Object.keys(oauthParams)
+    .sort()
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(oauthParams[k])}`)
+    .join('&');
 
-  twitterOAuthSessions.set(state, { codeVerifier, clientId, clientSecret, redirectUri });
+  const baseString = `${method.toUpperCase()}&${encodeURIComponent(url)}&${encodeURIComponent(paramString)}`;
+  const signingKey = `${encodeURIComponent(consumerSecret)}&${encodeURIComponent(accessTokenSecret)}`;
+  oauthParams.oauth_signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
 
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: 'tweet.read tweet.write users.read',
-    state,
-    code_challenge: codeChallenge,
-    code_challenge_method: 'S256',
-  });
+  return 'OAuth ' + Object.keys(oauthParams)
+    .sort()
+    .map(k => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`)
+    .join(', ');
+}
 
-  // Direct browser redirect — no JSON, opens Twitter login page directly
-  return res.redirect(`https://twitter.com/i/oauth2/authorize?${params}`);
-});
-
-app.get('/api/twitter/callback', async (req, res) => {
-  const { code, state, error } = req.query;
-
-  if (error) {
-    return res.send(`<html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;">
-      <div style="font-size:48px">❌</div>
-      <h2 style="margin:0">Twitter Hata: ${error}</h2>
-      <p style="color:#94a3b8;margin:0">Bu pencereyi kapatıp tekrar dene.</p>
-      <script>window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'${error}' }, '*');</script>
-    </body></html>`);
-  }
-
-  const session = twitterOAuthSessions.get(state);
-  if (!session) {
-    return res.send(`<html><body><script>
-      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'Geçersiz state' }, '*');
-      window.close();
-    </script><p>Hata: Geçersiz state.</p></body></html>`);
-  }
-  twitterOAuthSessions.delete(state);
-
+// Verify credentials and get user info
+app.post('/api/twitter/verify', async (req, res) => {
+  const { consumerKey, consumerSecret, accessToken, accessTokenSecret } = req.body;
+  if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret)
+    return res.status(400).json({ success: false, error: 'Tüm 4 alan gerekli.' });
   try {
-    const { codeVerifier, clientId, clientSecret, accountName, redirectUri } = session;
-
-    // Exchange code for tokens
-    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    const tokenRes = await fetch('https://api.twitter.com/2/oauth2/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: `Basic ${basicAuth}`,
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: redirectUri,
-        code_verifier: codeVerifier,
-      }),
-    });
-
-    const tokenData = await tokenRes.json();
-    if (!tokenRes.ok) throw new Error(JSON.stringify(tokenData));
-
-    // Get user info
-    const userRes = await fetch('https://api.twitter.com/2/users/me?user.fields=name,username,verified', {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` }
-    });
-    const userData = await userRes.json();
-    const twitterUser = userData.data || {};
-
-    const payload = JSON.stringify({
-      accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token || '',
-      clientId,
-      clientSecret,
-      username: twitterUser.username || accountName,
-      name: twitterUser.name || accountName,
-      accountName,
-    });
-
-    return res.send(`<html><body><script>
-      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_SUCCESS', payload: ${JSON.stringify(payload)} }, '*');
-      window.close();
-    </script><p>Twitter bağlantısı başarılı! Bu pencere kapanıyor...</p></body></html>`);
-  } catch (err) {
-    return res.send(`<html><body><script>
-      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:${JSON.stringify(err.message)} }, '*');
-      window.close();
-    </script><p>Hata: ${err.message}</p></body></html>`);
-  }
-});
-
-// Twitter OAuth 2.0 ─ Refresh token
-app.post('/api/twitter/refresh', async (req, res) => {
-  const { refreshToken, clientId, clientSecret } = req.body;
-  if (!refreshToken || !clientId) return res.status(400).json({ success: false, error: 'refreshToken ve clientId gerekli.' });
-  try {
-    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-    const r = await fetch('https://api.twitter.com/2/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Basic ${basicAuth}` },
-      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
-    });
+    const url = 'https://api.twitter.com/2/users/me?user.fields=name,username';
+    const auth = buildOAuth1Header('GET', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    const r = await fetch(url, { headers: { Authorization: auth } });
     const data = await r.json();
-    if (!r.ok) throw new Error(JSON.stringify(data));
-    return res.json({ success: true, accessToken: data.access_token, refreshToken: data.refresh_token });
+    if (data.data?.id) return res.json({ success: true, user: data.data });
+    return res.status(400).json({ success: false, error: JSON.stringify(data.errors || data) });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ Send tweet (OAuth 2.0 Bearer)
-// ═══════════════════════════════════════════════════════════════════════════
+// Send tweet with OAuth 1.0a
 app.post('/api/twitter/send', async (req, res) => {
-  const { accessToken, text } = req.body;
-  if (!accessToken || !text) return res.status(400).json({ success: false, error: 'accessToken ve text gerekli.' });
+  const { consumerKey, consumerSecret, accessToken, accessTokenSecret, text } = req.body;
+  if (!text) return res.status(400).json({ success: false, error: 'text gerekli.' });
+  if (!consumerKey || !accessToken)
+    return res.status(400).json({ success: false, error: 'Twitter kimlik bilgileri eksik.' });
   try {
-    const r = await fetch('https://api.twitter.com/2/tweets', {
+    const url = 'https://api.twitter.com/2/tweets';
+    const auth = buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    const r = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      headers: { 'Content-Type': 'application/json', Authorization: auth },
       body: JSON.stringify({ text }),
     });
     const data = await r.json();
@@ -323,6 +240,9 @@ app.post('/api/twitter/send', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  WHATSAPP ─ Send
@@ -398,8 +318,8 @@ app.post('/api/dispatch', async (req, res) => {
         r = await fetch(`${base}/api/telegram/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken: c.botToken, chatId: c.chatId, text, mediaUrl }) });
         result = await r.json();
       } else if (acc.platform === 'twitter') {
-        // OAuth 2.0: use accessToken directly
-        r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessToken: c.accessToken, text }) });
+        // OAuth 1.0a: use consumerKey + accessToken
+        r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, text }) });
         result = await r.json();
       } else if (acc.platform === 'whatsapp') {
         r = await fetch(`${base}/api/whatsapp/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessToken: c.accessToken, phoneNumberId: c.phoneNumberId, recipientPhone: c.recipientPhone, text, mediaUrl }) });
