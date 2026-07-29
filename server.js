@@ -175,25 +175,32 @@ app.get('/api/telegram/qr/poll', (req, res) => {
 //  TWITTER ─ OAuth 1.0a (API Key + Access Token — no redirect needed)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Build OAuth 1.0a Authorization header
-function buildOAuth1Header(method, url, consumerKey, consumerSecret, accessToken, accessTokenSecret) {
+// Build OAuth 1.0a Authorization header (RFC 5849 compliant)
+function buildOAuth1Header(method, targetUrl, consumerKey, consumerSecret, accessToken, accessTokenSecret) {
+  const urlObj = new URL(targetUrl);
+  const baseUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
+
   const oauthParams = {
-    oauth_consumer_key:     consumerKey,
+    oauth_consumer_key:     consumerKey.trim(),
     oauth_nonce:            crypto.randomBytes(16).toString('hex'),
     oauth_signature_method: 'HMAC-SHA1',
     oauth_timestamp:        Math.floor(Date.now() / 1000).toString(),
-    oauth_token:            accessToken,
+    oauth_token:            accessToken.trim(),
     oauth_version:          '1.0',
   };
 
-  // Signature base string (no JSON body params — only URL + oauth params)
-  const paramString = Object.keys(oauthParams)
+  const allParams = { ...oauthParams };
+  urlObj.searchParams.forEach((val, key) => {
+    allParams[key] = val;
+  });
+
+  const paramString = Object.keys(allParams)
     .sort()
-    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(oauthParams[k])}`)
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
     .join('&');
 
-  const baseString = `${method.toUpperCase()}&${encodeURIComponent(url)}&${encodeURIComponent(paramString)}`;
-  const signingKey = `${encodeURIComponent(consumerSecret)}&${encodeURIComponent(accessTokenSecret)}`;
+  const baseString = `${method.toUpperCase()}&${encodeURIComponent(baseUrl)}&${encodeURIComponent(paramString)}`;
+  const signingKey = `${encodeURIComponent(consumerSecret.trim())}&${encodeURIComponent(accessTokenSecret.trim())}`;
   oauthParams.oauth_signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
 
   return 'OAuth ' + Object.keys(oauthParams)
@@ -208,12 +215,28 @@ app.post('/api/twitter/verify', async (req, res) => {
   if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret)
     return res.status(400).json({ success: false, error: 'Tüm 4 alan gerekli.' });
   try {
-    const url = 'https://api.twitter.com/2/users/me?user.fields=name,username';
-    const auth = buildOAuth1Header('GET', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
-    const r = await fetch(url, { headers: { Authorization: auth } });
-    const data = await r.json();
-    if (data.data?.id) return res.json({ success: true, user: data.data });
-    return res.status(400).json({ success: false, error: JSON.stringify(data.errors || data) });
+    // Try v1.1 verify_credentials first
+    const url1 = 'https://api.twitter.com/1.1/account/verify_credentials.json';
+    const auth1 = buildOAuth1Header('GET', url1, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    const r1 = await fetch(url1, { headers: { Authorization: auth1 } });
+    const data1 = await r1.json();
+    
+    if (r1.ok && (data1.screen_name || data1.name)) {
+      return res.json({ success: true, user: { username: data1.screen_name, name: data1.name || data1.screen_name } });
+    }
+
+    // Fallback: try v2 users/me
+    const url2 = 'https://api.twitter.com/2/users/me';
+    const auth2 = buildOAuth1Header('GET', url2, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    const r2 = await fetch(url2, { headers: { Authorization: auth2 } });
+    const data2 = await r2.json();
+
+    if (r2.ok && data2.data?.id) {
+      return res.json({ success: true, user: data2.data });
+    }
+
+    const errDetail = (data1.errors && data1.errors[0]?.message) || data2.detail || data2.title || JSON.stringify(data1 || data2);
+    return res.status(400).json({ success: false, error: errDetail });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
