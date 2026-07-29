@@ -50,7 +50,7 @@ const PLATFORMS = {
 
 // ── Twitter: 1-Click OAuth + Manual Key tabs ─────────────────────────────────
 function TwitterPanel({ onSave, onCancel }) {
-  const [mode, setMode] = useState('oauth'); // 'oauth' | 'keys'
+  const [mode, setMode] = useState('keys'); // 'keys' | 'oauth'
   const [status, setStatus] = useState('idle'); // idle | waiting | loading | done | error
   const [errorMsg, setErrorMsg] = useState('');
 
