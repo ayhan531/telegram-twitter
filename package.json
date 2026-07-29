@@ -14,8 +14,10 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "lucide-react": "^0.344.0",
+    "qrcode": "^1.5.4",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "teleproto": "^1.228.4"
   },
   "devDependencies": {
     "@types/react": "^18.2.64",
