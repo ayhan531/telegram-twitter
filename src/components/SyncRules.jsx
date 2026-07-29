@@ -282,8 +282,9 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
           <span className="text-sky-400 font-mono shrink-0">3.</span>
           <span>O kanalda yeni mesaj geldiğinde sistem otomatik tweet/mesaj atar — sen hiçbir şey yapmadan</span>
         </div>
-        <div className="mt-2 p-2.5 rounded-lg bg-amber-950/30 border border-amber-500/20 text-amber-300">
-          ⚠️ Render free tier 15 dk boşta kalınca uyur — aktif kullanım veya ücretli plan için sürekli çalışır.
+        <div className="mt-2 p-2.5 rounded-lg bg-amber-950/30 border border-amber-500/20 text-amber-300 space-y-1">
+          <p>⚠️ Render'ın ücretsiz planı 15 dk trafik gelmezse sunucuyu uyutuyor. Bu sayfa açıkken sistem her dakika kendini otomatik onarıyor (Telegram dinleyicisini ve kuralları yeniden kuruyor), o yüzden sekmeyi açık tutmak yeterli.</p>
+          <p>Tarayıcı kapalıyken de kesintisiz çalışsın istiyorsan, <a href="https://cron-job.org" target="_blank" rel="noopener noreferrer" className="underline">cron-job.org</a> gibi ücretsiz bir servisle bu adrese 10 dakikada bir istek attır — Render hiç uyumaz.</p>
         </div>
       </div>
 

@@ -424,11 +424,6 @@ app.post('/api/twitter/free-login', async (req, res) => {
   }
   try {
     const scraper = new Scraper();
-    // login() itself throws if the credentials are wrong or a subtask fails,
-    // so a clean resolve here means the session cookies are valid. We
-    // deliberately avoid isLoggedIn()/me() — they call the deprecated
-    // v1.1 verify_credentials endpoint, which X now returns "page does not
-    // exist" (code 34) for on this auth flow even with a valid session.
     await scraper.login(username.trim(), password, email?.trim() || undefined, twoFactorSecret?.trim() || undefined);
 
     const cookies = (await scraper.getCookies()).map(c => c.toString());
@@ -436,11 +431,15 @@ app.post('/api/twitter/free-login', async (req, res) => {
       throw new Error('Giriş başarısız. Kullanıcı adı/şifreyi kontrol et.');
     }
 
-    let profile = null;
-    try {
-      const profileRes = await scraper.getProfile(username.trim());
-      profile = profileRes || null;
-    } catch (_) { /* profile lookup is best-effort, cookies are what matter */ }
+    // Real authenticated check (this hits verify_credentials.json using the
+    // now-established user session, not the guest-token login flow — it
+    // actually confirms Twitter accepts these cookies for authenticated
+    // requests, instead of just trusting that login() didn't throw).
+    const loggedIn = await scraper.isLoggedIn();
+    if (!loggedIn) {
+      throw new Error('Oturum doğrulanamadı. Twitter bu çerezleri reddetti — "Çerezle Bağlan" sekmesini kullanmayı dene.');
+    }
+    const profile = await scraper.me();
 
     return res.json({
       success: true,
@@ -471,6 +470,7 @@ app.post('/api/twitter/free-login-cookies', async (req, res) => {
   if (!authToken || !ct0) {
     return res.status(400).json({ success: false, error: 'auth_token ve ct0 çerez değerleri gerekli.' });
   }
+  const cleanUsername = username?.trim().replace(/^@/, '') || '';
   try {
     const scraper = new Scraper();
     await scraper.setCookies([
@@ -478,23 +478,28 @@ app.post('/api/twitter/free-login-cookies', async (req, res) => {
       `ct0=${ct0.trim()}; Domain=twitter.com; Path=/`,
     ]);
 
-    let profile = null;
-    if (username?.trim()) {
-      try { profile = await scraper.getProfile(username.trim()); } catch (_) {}
+    // Actually verify these cookies authenticate — getProfile() works even
+    // for logged-out guests, so it can't tell us whether tweeting will work.
+    // isLoggedIn()/me() hit verify_credentials.json with the real session
+    // and fail loudly (instead of silently) if the cookies are stale/wrong.
+    const loggedIn = await scraper.isLoggedIn();
+    if (!loggedIn) {
+      throw new Error('Twitter bu çerezleri kabul etmedi. auth_token/ct0 süresi dolmuş olabilir — x.com\'da çıkış yapmadan (!) tekrar DevTools\'tan taze değerleri kopyala.');
     }
+    const profile = await scraper.me();
 
     const cookies = (await scraper.getCookies()).map(c => c.toString());
     return res.json({
       success: true,
       user: {
-        username: profile?.username || username?.trim() || 'twitter',
-        name: profile?.name || profile?.username || username?.trim() || 'Twitter Hesabı',
+        username: profile?.username || cleanUsername || 'twitter',
+        name: profile?.name || profile?.username || cleanUsername || 'Twitter Hesabı',
       },
       cookies,
     });
   } catch (err) {
     console.error('[Twitter free-login-cookies] failed:', err.message);
-    return res.status(400).json({ success: false, error: 'Çerezler geçersiz görünüyor: ' + err.message });
+    return res.status(400).json({ success: false, error: err.message.includes('çerez') ? err.message : 'Çerezler geçersiz görünüyor: ' + err.message });
   }
 });
 
