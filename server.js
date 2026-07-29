@@ -32,11 +32,41 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'online', app: 'OmniSync Social', version: '3.2.0' });
 });
 
-app.get('/api/config', (_req, res) => {
+app.get('/api/config', async (_req, res) => {
+  const telegramReady = !!(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH);
+  
+  const ck  = process.env.TWITTER_CONSUMER_KEY || process.env.TWITTER_API_KEY;
+  const cs  = process.env.TWITTER_CONSUMER_SECRET || process.env.TWITTER_API_SECRET;
+  const at  = process.env.TWITTER_ACCESS_TOKEN;
+  const ats = process.env.TWITTER_ACCESS_TOKEN_SECRET;
+
+  let autoTwitterAccount = null;
+  if (ck && cs && at && ats) {
+    try {
+      const url = 'https://api.twitter.com/1.1/account/verify_credentials.json';
+      const auth = buildOAuth1Header('GET', url, ck, cs, at, ats);
+      const r = await fetch(url, { headers: { Authorization: auth } });
+      const d = await r.json();
+      if (r.ok && (d.screen_name || d.name)) {
+        autoTwitterAccount = {
+          id: 'acc-env-twitter',
+          platform: 'twitter',
+          name: d.name || d.screen_name || 'Twitter Hesabı',
+          username: `@${d.screen_name}`,
+          status: 'connected',
+          avatarColor: 'bg-neutral-800',
+          credentials: { consumerKey: ck, consumerSecret: cs, accessToken: at, accessTokenSecret: ats }
+        };
+      }
+    } catch (e) {}
+  }
+
   res.json({
-    telegramReady: !!(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH),
+    telegramReady,
+    autoTwitterAccount,
   });
 });
+
 
 
 // ═══════════════════════════════════════════════════════════════════════════

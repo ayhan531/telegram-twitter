@@ -41,6 +41,24 @@ export default function App() {
   useEffect(() => { saveStoredData('hashtags', hashtagPresets); }, [hashtagPresets]);
   useEffect(() => { saveStoredData('logs', logs); }, [logs]);
 
+  // Auto-connect Twitter if Environment Variables are set on Render
+  useEffect(() => {
+    fetch('/api/config')
+      .then(r => r.json())
+      .then(d => {
+        if (d.autoTwitterAccount) {
+          setAccounts(prev => {
+            if (prev.some(a => a.id === d.autoTwitterAccount.id || a.username === d.autoTwitterAccount.username)) {
+              return prev;
+            }
+            return [...prev, d.autoTwitterAccount];
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+
   const showToast = (message, type = 'info') => {
     setToast({ visible: true, message, type });
     setTimeout(() => {
