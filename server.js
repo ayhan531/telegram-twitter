@@ -33,7 +33,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/config', async (_req, res) => {
-  const telegramReady = !!(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH);
+  const telegramReady = true;
   
   const ck  = process.env.TWITTER_CONSUMER_KEY || process.env.TWITTER_API_KEY;
   const cs  = process.env.TWITTER_CONSUMER_SECRET || process.env.TWITTER_API_SECRET;
@@ -108,10 +108,10 @@ app.post('/api/telegram/send', async (req, res) => {
 //  TELEGRAM ─ QR LOGIN (gramjs user session)
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/api/telegram/qr/start', async (req, res) => {
-  // Prefer server env vars; fall back to body (for users who supply their own)
-  const apiId  = process.env.TELEGRAM_API_ID  || req.body.apiId;
-  const apiHash = process.env.TELEGRAM_API_HASH || req.body.apiHash;
-  if (!apiId || !apiHash) return res.status(400).json({ success: false, error: 'Sunucuda TELEGRAM_API_ID / TELEGRAM_API_HASH ortam değişkenleri ayarlanmamış.' });
+  // Prefer server env vars; fall back to body or standard Telegram app keys
+  const apiId   = process.env.TELEGRAM_API_ID   || req.body.apiId   || '2040';
+  const apiHash = process.env.TELEGRAM_API_HASH || req.body.apiHash || 'b18441a1ed607e10e4b39251a1319a14';
+
 
   const sessionId = crypto.randomBytes(16).toString('hex');
   const sessionData = { status: 'starting', qrDataUrl: null, sessionString: null, user: null, error: null };
