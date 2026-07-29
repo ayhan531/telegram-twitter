@@ -50,7 +50,7 @@ const PLATFORMS = {
 
 // ── Twitter: 1-Click OAuth + Manual Key tabs ─────────────────────────────────
 function TwitterPanel({ onSave, onCancel }) {
-  const [mode, setMode] = useState('keys'); // 'keys' | 'oauth'
+  const [mode, setMode] = useState('oauth'); // 'keys' | 'oauth'
   const [status, setStatus] = useState('idle'); // idle | waiting | loading | done | error
   const [errorMsg, setErrorMsg] = useState('');
 
@@ -182,6 +182,12 @@ function TwitterPanel({ onSave, onCancel }) {
         </div>
       ) : (
         <div className="space-y-3">
+          <div className="p-3.5 rounded-xl bg-neutral-900/60 border border-neutral-700 text-xs text-slate-300 space-y-1 leading-relaxed">
+            <p className="font-bold text-white">developer.twitter.com'dan 2 dakikada anahtar al:</p>
+            <p>1. <a href="https://developer.twitter.com/en/portal/dashboard" target="_blank" rel="noopener noreferrer" className="underline text-sky-400">developer.twitter.com/portal/dashboard</a> adresine git → bir proje/app oluştur</p>
+            <p>2. App ayarlarında <strong>User authentication settings</strong> → <strong>Read and Write</strong> izni seç (tweet atabilmek için şart!)</p>
+            <p>3. <strong>Keys and tokens</strong> sekmesinden <strong>API Key/Secret</strong> ve <strong>Access Token/Secret</strong>'ı üret ve aşağıya yapıştır</p>
+          </div>
           <div>
             <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key (Consumer Key)</label>
             <input type="text" value={consumerKey} onChange={e => setConsumerKey(e.target.value.trim())}

@@ -9,6 +9,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+app.set('trust proxy', 1); // Render terminates TLS upstream; trust X-Forwarded-Proto so req.protocol is 'https'
 
 // ─── Server-side credentials (set in Render Environment Variables) ──────────
 // TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET
