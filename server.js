@@ -10,6 +10,11 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ─── Server-side credentials (set in Render Environment Variables) ──────────
+// TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET
+// TELEGRAM_API_ID,   TELEGRAM_API_HASH
+// These are NEVER exposed to the frontend.
+
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
@@ -18,10 +23,18 @@ const twitterOAuthSessions = new Map(); // state -> { codeVerifier, clientId, cl
 const tgQRSessions = new Map();         // sessionId -> { status, qrDataUrl, sessionString, user, error, client }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HEALTH
+//  HEALTH + CONFIG (tells frontend which services are ready)
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'online', app: 'OmniSync Social', version: '3.0.0' });
+  res.json({ status: 'online', app: 'OmniSync Social', version: '3.1.0' });
+});
+
+// Frontend calls this to know which one-click logins are available
+app.get('/api/config', (_req, res) => {
+  res.json({
+    twitterReady: !!(process.env.TWITTER_CLIENT_ID && process.env.TWITTER_CLIENT_SECRET),
+    telegramReady: !!(process.env.TELEGRAM_API_ID && process.env.TELEGRAM_API_HASH),
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,8 +76,10 @@ app.post('/api/telegram/send', async (req, res) => {
 //  TELEGRAM ─ QR LOGIN (gramjs user session)
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/api/telegram/qr/start', async (req, res) => {
-  const { apiId, apiHash } = req.body;
-  if (!apiId || !apiHash) return res.status(400).json({ success: false, error: 'API ID ve API Hash gerekli.' });
+  // Prefer server env vars; fall back to body (for users who supply their own)
+  const apiId  = process.env.TELEGRAM_API_ID  || req.body.apiId;
+  const apiHash = process.env.TELEGRAM_API_HASH || req.body.apiHash;
+  if (!apiId || !apiHash) return res.status(400).json({ success: false, error: 'Sunucuda TELEGRAM_API_ID / TELEGRAM_API_HASH ortam değişkenleri ayarlanmamış.' });
 
   const sessionId = crypto.randomBytes(16).toString('hex');
   const sessionData = { status: 'starting', qrDataUrl: null, sessionString: null, user: null, error: null };
@@ -155,19 +170,25 @@ app.get('/api/telegram/qr/poll', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ OAuth 2.0 PKCE
+//  TWITTER ─ OAuth 2.0 PKCE  (credentials come from server env vars)
 // ═══════════════════════════════════════════════════════════════════════════
-app.post('/api/twitter/oauth/start', (req, res) => {
-  const { clientId, clientSecret, accountName } = req.body;
-  if (!clientId) return res.status(400).json({ success: false, error: 'Client ID gerekli.' });
+app.get('/api/twitter/oauth/start', (req, res) => {
+  const clientId     = process.env.TWITTER_CLIENT_ID;
+  const clientSecret = process.env.TWITTER_CLIENT_SECRET;
 
-  const state = crypto.randomBytes(16).toString('hex');
+  if (!clientId || !clientSecret) {
+    return res.status(503).json({
+      success: false,
+      error: 'Sunucuda TWITTER_CLIENT_ID ve TWITTER_CLIENT_SECRET ortam değişkenleri ayarlanmamış. Render → Environment bölümünden ekleyin.'
+    });
+  }
+
+  const state        = crypto.randomBytes(16).toString('hex');
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
   const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  const redirectUri  = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
 
-  const redirectUri = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
-
-  twitterOAuthSessions.set(state, { codeVerifier, clientId, clientSecret, accountName, redirectUri });
+  twitterOAuthSessions.set(state, { codeVerifier, clientId, clientSecret, redirectUri });
 
   const params = new URLSearchParams({
     response_type: 'code',
@@ -179,7 +200,8 @@ app.post('/api/twitter/oauth/start', (req, res) => {
     code_challenge_method: 'S256',
   });
 
-  return res.json({ success: true, authUrl: `https://twitter.com/i/oauth2/authorize?${params}`, state });
+  // Direct browser redirect — no JSON, opens Twitter login page directly
+  return res.redirect(`https://twitter.com/i/oauth2/authorize?${params}`);
 });
 
 app.get('/api/twitter/callback', async (req, res) => {
