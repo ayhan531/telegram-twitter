@@ -445,9 +445,50 @@ app.post('/api/twitter/free-login', async (req, res) => {
       cookies,
     });
   } catch (err) {
+    console.error('[Twitter free-login] failed:', err.message);
     let msg = err.message || 'Giriş başarısız.';
-    if (/acid|arkose|challenge/i.test(msg)) msg = 'Twitter ek doğrulama istiyor. Birkaç dakika sonra tekrar dene veya tarayıcıdan bir kez giriş yaparak hesabı ısındır.';
+    if (/acid|arkose|challenge|LoginAcid|Denied login/i.test(msg)) {
+      msg = 'X (Twitter) bu girişi şüpheli buldu ve ek doğrulama istiyor. Bu genellikle sunucu IP\'sinden otomatik giriş denemelerinde olur. Aşağıdaki "Çerezle Bağlan" sekmesini kullan — %100 çalışır ve şifreni hiç sunucuya göndermez.';
+    } else if (/page does not exist|does not exist/i.test(msg)) {
+      msg = 'X şu an bu otomatik giriş yöntemini engelliyor (sunucu IP\'si şüpheli görünüyor olabilir). Aşağıdaki "Çerezle Bağlan" sekmesini kullan — kesin çözüm.';
+    }
     return res.status(400).json({ success: false, error: msg });
+  }
+});
+
+// ── Cookie-paste login: the most reliable free method. The user logs into
+// x.com in their own browser (so it looks like a normal human session, not
+// a datacenter IP hitting Twitter's login flow) and pastes the auth_token +
+// ct0 cookies here. No password ever touches our server.
+app.post('/api/twitter/free-login-cookies', async (req, res) => {
+  const { authToken, ct0, username } = req.body;
+  if (!authToken || !ct0) {
+    return res.status(400).json({ success: false, error: 'auth_token ve ct0 çerez değerleri gerekli.' });
+  }
+  try {
+    const scraper = new Scraper();
+    await scraper.setCookies([
+      `auth_token=${authToken.trim()}; Domain=twitter.com; Path=/`,
+      `ct0=${ct0.trim()}; Domain=twitter.com; Path=/`,
+    ]);
+
+    let profile = null;
+    if (username?.trim()) {
+      try { profile = await scraper.getProfile(username.trim()); } catch (_) {}
+    }
+
+    const cookies = (await scraper.getCookies()).map(c => c.toString());
+    return res.json({
+      success: true,
+      user: {
+        username: profile?.username || username?.trim() || 'twitter',
+        name: profile?.name || profile?.username || username?.trim() || 'Twitter Hesabı',
+      },
+      cookies,
+    });
+  } catch (err) {
+    console.error('[Twitter free-login-cookies] failed:', err.message);
+    return res.status(400).json({ success: false, error: 'Çerezler geçersiz görünüyor: ' + err.message });
   }
 });
 

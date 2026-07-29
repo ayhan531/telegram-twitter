@@ -50,9 +50,15 @@ const PLATFORMS = {
 
 // ── Twitter: Free (cookie) login + 1-Click OAuth + Manual Key tabs ──────────
 function TwitterPanel({ onSave, onCancel }) {
-  const [mode, setMode] = useState('free'); // 'free' | 'keys' | 'oauth'
+  const [mode, setMode] = useState('cookie'); // 'cookie' | 'password' | 'keys' | 'oauth'
   const [status, setStatus] = useState('idle'); // idle | waiting | loading | done | error
   const [errorMsg, setErrorMsg] = useState('');
+
+  // Cookie-paste login (most reliable free method)
+  const [ckUsername, setCkUsername] = useState('');
+  const [ckAuthToken, setCkAuthToken] = useState('');
+  const [ckCt0, setCkCt0] = useState('');
+  const [showCkAuth, setShowCkAuth] = useState(false);
 
   // Free login (username + password, no developer account needed)
   const [twUsername, setTwUsername] = useState('');
@@ -68,6 +74,30 @@ function TwitterPanel({ onSave, onCancel }) {
   const [accessToken,       setAccessToken]       = useState('');
   const [accessTokenSecret, setAccessTokenSecret] = useState('');
   const [show, setShow] = useState({ cs: false, ats: false });
+
+  const handleCookieLogin = async () => {
+    if (!ckAuthToken || !ckCt0) { setErrorMsg('auth_token ve ct0 değerlerini yapıştır.'); return; }
+    setStatus('loading'); setErrorMsg('');
+    try {
+      const r = await fetch('/api/twitter/free-login-cookies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ authToken: ckAuthToken, ct0: ckCt0, username: ckUsername || undefined }),
+      });
+      const d = await r.json();
+      if (!d.success) throw new Error(d.error);
+      setStatus('done');
+      onSave({
+        platform: 'twitter',
+        name: d.user.name || d.user.username,
+        username: `@${d.user.username}`,
+        credentials: { cookies: d.cookies },
+      });
+    } catch (err) {
+      setStatus('error');
+      setErrorMsg(err.message);
+    }
+  };
 
   const handleFreeLogin = async () => {
     if (!twUsername || !twPassword) { setErrorMsg('Kullanıcı adı ve şifre gerekli.'); return; }
@@ -175,10 +205,14 @@ function TwitterPanel({ onSave, onCancel }) {
   return (
     <div className="space-y-4">
       {/* Mode switcher tabs */}
-      <div className="flex bg-slate-800/60 p-1 rounded-xl border border-slate-700">
-        <button onClick={() => { setMode('free'); setErrorMsg(''); }}
-          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'free' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
-          🔓 Ücretsiz Giriş (Önerilen)
+      <div className="flex bg-slate-800/60 p-1 rounded-xl border border-slate-700 flex-wrap gap-1">
+        <button onClick={() => { setMode('cookie'); setErrorMsg(''); }}
+          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'cookie' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          🍪 Çerezle Bağlan (Önerilen)
+        </button>
+        <button onClick={() => { setMode('password'); setErrorMsg(''); }}
+          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'password' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          🔓 Şifre ile Dene
         </button>
         <button onClick={() => { setMode('oauth'); setErrorMsg(''); }}
           className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'oauth' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
@@ -190,11 +224,49 @@ function TwitterPanel({ onSave, onCancel }) {
         </button>
       </div>
 
-      {mode === 'free' ? (
+      {mode === 'cookie' ? (
         <div className="space-y-3">
-          <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/20 text-xs text-emerald-200 leading-relaxed">
-            <p className="font-bold text-emerald-300 mb-1">Twitter Developer hesabı / API ücreti YOK.</p>
-            <p>Normal Twitter kullanıcı adı ve şifreni gir, sistem senin adına tarayıcı oturumu açıp otomatik tweet atar. Client ID, API Key, Access Token gibi hiçbir şeyle uğraşmana gerek yok.</p>
+          <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/20 text-xs text-emerald-200 leading-relaxed space-y-1.5">
+            <p className="font-bold text-emerald-300">Twitter Developer hesabı / API ücreti YOK — %100 çalışan yöntem.</p>
+            <p>Kendi tarayıcından zaten giriş yapmış olduğun oturumu kullanıyoruz, bu yüzden Twitter'ın "şüpheli giriş" korumasına takılmıyor:</p>
+            <p>1. <a href="https://x.com" target="_blank" rel="noopener noreferrer" className="underline text-sky-400">x.com</a>'a git ve normal şekilde giriş yap</p>
+            <p>2. Klavyeden <strong>F12</strong>'ye bas → <strong>Application</strong> (veya Storage) sekmesi → soldan <strong>Cookies</strong> → <strong>https://x.com</strong></p>
+            <p>3. Listede <code className="text-sky-400">auth_token</code> ve <code className="text-sky-400">ct0</code> satırlarını bul, <strong>Value</strong> sütunundaki değerleri kopyala aşağı yapıştır</p>
+          </div>
+
+          {errorMsg && <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300 leading-relaxed">{errorMsg}</div>}
+
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">Kullanıcı Adı (@olmadan, isteğe bağlı)</label>
+            <input type="text" value={ckUsername} onChange={e => setCkUsername(e.target.value.trim())}
+              placeholder="kullaniciadi" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
+          </div>
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">auth_token çerezi</label>
+            <div className="relative">
+              <input type={showCkAuth ? 'text' : 'password'} value={ckAuthToken} onChange={e => setCkAuthToken(e.target.value.trim())}
+                placeholder="auth_token değeri" className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+              <button type="button" onClick={() => setShowCkAuth(p => !p)} className="absolute right-3 top-2 text-slate-400 hover:text-white">
+                {showCkAuth ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="text-[11px] font-bold text-slate-300 block mb-1">ct0 çerezi</label>
+            <input type="text" value={ckCt0} onChange={e => setCkCt0(e.target.value.trim())}
+              placeholder="ct0 değeri" className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+          </div>
+
+          <button onClick={handleCookieLogin} disabled={status === 'loading'}
+            className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm flex items-center justify-center space-x-2 shadow-md transition">
+            {status === 'loading' ? <Loader2 size={16} className="animate-spin" /> : <span>Bağla ✓</span>}
+          </button>
+        </div>
+      ) : mode === 'password' ? (
+        <div className="space-y-3">
+          <div className="p-3.5 rounded-xl bg-amber-950/30 border border-amber-500/20 text-xs text-amber-200 leading-relaxed">
+            <p className="font-bold text-amber-300 mb-1">Bazen X bunu engelleyebilir.</p>
+            <p>Sunucudan direkt kullanıcı adı/şifre ile giriş dener. X şüpheli bulursa reddedebilir — olursa "Çerezle Bağlan" sekmesini kullan, o kesin çalışır.</p>
           </div>
 
           {errorMsg && <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300 leading-relaxed">{errorMsg}</div>}
