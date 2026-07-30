@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
+import fs from 'fs';
 import { Scraper } from 'agent-twitter-client';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,6 +28,40 @@ const tgActiveSessions    = new Map(); // accountId -> { client, sessionString, 
 const syncRulesStore      = new Map(); // ruleId -> rule object
 const recentlySynced      = new Set(); // messageId -> to prevent double-posting
 const syncLog             = [];        // audit trail for auto-sync attempts (Telegram msg -> Twitter etc.)
+
+// ─── Disk persistence ────────────────────────────────────────────────────────
+// So a plain server restart (crash, redeploy) doesn't force the user to
+// reconnect Telegram/rescan a QR — the frontend heartbeat covers the case
+// where a browser tab is open, this covers it even when no one is looking.
+// On Render this survives restarts of the same instance; it only survives a
+// full redeploy too if DATA_DIR points at an attached persistent Disk.
+const DATA_DIR   = process.env.DATA_DIR || path.join(__dirname, 'data');
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
+
+function saveState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const sessions = [...tgActiveSessions.values()].map(s => ({
+      accountId: s.accountId, accountName: s.accountName,
+      sessionString: s.sessionString, apiId: s.apiId, apiHash: s.apiHash,
+    }));
+    const rules = [...syncRulesStore.values()];
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules }, null, 2));
+  } catch (e) {
+    console.error('[Persist] Failed to save state:', e.message);
+  }
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [] };
+    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    return { sessions: parsed.sessions || [], rules: parsed.rules || [] };
+  } catch (e) {
+    console.error('[Persist] Failed to load state:', e.message);
+    return { sessions: [], rules: [] };
+  }
+}
 
 function pushSyncLog(entry) {
   syncLog.unshift({ id: `synclog-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, timestamp: new Date().toLocaleString('tr-TR'), ...entry });
@@ -627,11 +662,16 @@ app.post('/api/dispatch', async (req, res) => {
 //  TELEGRAM SESSION STORE (frontend pushes session after QR login)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Store a Telegram user session on the server so we can listen to messages
+// Store a Telegram user session on the server so we can listen to messages.
+// The frontend re-posts this on a heartbeat to self-heal after restarts, so
+// we must NOT clobber an already-connected client — that would silently
+// spin up a second listener alongside the first and double-post everything.
 app.post('/api/telegram/session/store', (req, res) => {
   const { accountId, accountName, sessionString, apiId, apiHash } = req.body;
   if (!accountId || !sessionString) return res.status(400).json({ success: false, error: 'accountId ve sessionString gerekli.' });
-  tgActiveSessions.set(accountId, { accountId, accountName, sessionString, apiId, apiHash, client: null });
+  const existing = tgActiveSessions.get(accountId);
+  tgActiveSessions.set(accountId, { accountId, accountName, sessionString, apiId, apiHash, client: existing?.client || null });
+  saveState();
   return res.json({ success: true, message: 'Oturum sunucuya kaydedildi.' });
 });
 
@@ -656,11 +696,13 @@ app.post('/api/sync/rules', (req, res) => {
   const rule = req.body;
   if (!rule?.id) return res.status(400).json({ success: false, error: 'rule.id gerekli.' });
   syncRulesStore.set(rule.id, { ...rule, enabled: rule.enabled !== false });
+  saveState();
   return res.json({ success: true });
 });
 
 app.delete('/api/sync/rules/:id', (req, res) => {
   syncRulesStore.delete(req.params.id);
+  saveState();
   return res.json({ success: true });
 });
 
@@ -863,5 +905,21 @@ app.post('/api/sync/test', async (req, res) => {
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
 app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
+
+// ─── Restore persisted state on boot: revive sync rules + reconnect any
+// Telegram sessions we knew about before this restart, without waiting on
+// the frontend heartbeat or the user reconnecting anything by hand.
+function restoreState() {
+  const { sessions, rules } = loadState();
+  for (const rule of rules) syncRulesStore.set(rule.id, rule);
+  for (const s of sessions) {
+    tgActiveSessions.set(s.accountId, { ...s, client: null });
+    startTelegramListener(s.accountId).catch(e => console.error(`[Persist] Restore listener failed for ${s.accountId}:`, e.message));
+  }
+  if (sessions.length || rules.length) {
+    console.log(`[Persist] Restored ${sessions.length} Telegram session(s) and ${rules.length} sync rule(s) from disk.`);
+  }
+}
+restoreState();
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 OmniSync Social v3.2 port ${PORT}`));

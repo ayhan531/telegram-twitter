@@ -13,6 +13,9 @@ dist/
 dist-ssr/
 *.local
 
+# Persisted runtime state (Telegram session strings, Twitter cookies) — never commit
+data/
+
 # Editor directories
 .vscode/*
 !.vscode/extensions.json
