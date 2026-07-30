@@ -40,13 +40,16 @@ const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 function saveState() {
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+    // This file holds Telegram session strings and Twitter session cookies
+    // in the clear — restrict it to the owning process's user only.
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
     const sessions = [...tgActiveSessions.values()].map(s => ({
       accountId: s.accountId, accountName: s.accountName,
       sessionString: s.sessionString, apiId: s.apiId, apiHash: s.apiHash,
     }));
     const rules = [...syncRulesStore.values()];
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules }, null, 2));
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules }, null, 2), { mode: 0o600 });
+    fs.chmodSync(STATE_FILE, 0o600); // writeFileSync's mode only applies when creating the file, not on overwrite
   } catch (e) {
     console.error('[Persist] Failed to save state:', e.message);
   }
