@@ -50,7 +50,7 @@ const PLATFORMS = {
 
 // ── Twitter: Free (cookie) login + 1-Click OAuth + Manual Key tabs ──────────
 function TwitterPanel({ onSave, onCancel }) {
-  const [mode, setMode] = useState('cookie'); // 'cookie' | 'password' | 'keys' | 'oauth'
+  const [mode, setMode] = useState('oauth'); // 'oauth' | 'cookie' | 'password' | 'keys'
   const [status, setStatus] = useState('idle'); // idle | waiting | loading | done | error
   const [errorMsg, setErrorMsg] = useState('');
 
@@ -206,17 +206,17 @@ function TwitterPanel({ onSave, onCancel }) {
     <div className="space-y-4">
       {/* Mode switcher tabs */}
       <div className="flex bg-slate-800/60 p-1 rounded-xl border border-slate-700 flex-wrap gap-1">
+        <button onClick={() => { setMode('oauth'); setErrorMsg(''); }}
+          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'oauth' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+          ⚡ Bir Kez Bağlan (Önerilen)
+        </button>
         <button onClick={() => { setMode('cookie'); setErrorMsg(''); }}
           className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'cookie' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
-          🍪 Çerezle Bağlan (Önerilen)
+          🍪 Çerezle Bağlan
         </button>
         <button onClick={() => { setMode('password'); setErrorMsg(''); }}
           className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'password' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
           🔓 Şifre ile Dene
-        </button>
-        <button onClick={() => { setMode('oauth'); setErrorMsg(''); }}
-          className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'oauth' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
-          ⚡ OAuth
         </button>
         <button onClick={() => { setMode('keys'); setErrorMsg(''); }}
           className={`flex-1 py-1.5 rounded-lg text-[11px] font-bold transition ${mode === 'keys' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
@@ -316,9 +316,12 @@ function TwitterPanel({ onSave, onCancel }) {
           <div className="w-16 h-16 rounded-2xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-3xl font-black text-white shadow-xl">
             𝕏
           </div>
-          <div className="text-center space-y-1">
+          <div className="text-center space-y-2">
             <p className="text-sm font-bold text-white">İstediğin Twitter Hesabını 1-Tıkla Bağla</p>
-            <p className="text-xs text-slate-400">Butona bas → Açılan sayfada izin ver → İstediğin kadar hesap ekle!</p>
+            <p className="text-xs text-slate-400">Butona bas → gerçek Twitter/X giriş sayfasında normal şekilde giriş yap → izin ver.</p>
+            <p className="text-[11px] text-emerald-400 bg-emerald-950/30 border border-emerald-500/20 rounded-lg px-3 py-2">
+              ✅ Bunu bir kez yaparsın, biter. Oturum otomatik olarak kendini yeniler — tekrar şifre girmene gerek kalmaz.
+            </p>
           </div>
 
           {errorMsg && (

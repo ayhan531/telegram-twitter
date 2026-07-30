@@ -318,29 +318,66 @@ app.post('/api/twitter/verify', async (req, res) => {
   }
 });
 
-// Send tweet (supports both OAuth 1.0a and OAuth 2.0 Bearer)
+// OAuth 2.0 access tokens expire after ~2h. We requested the
+// `offline.access` scope at login time specifically so we'd get a
+// refresh_token back — use it to silently mint a new access token instead
+// of the automation quietly dying every couple of hours.
+async function refreshTwitterOAuth2Token(refreshToken) {
+  const clientId     = process.env.TWITTER_CLIENT_ID || 'UXdLRTNQNmxTVW1Fc1pwWVVmVmI6MTpjaQ';
+  const clientSecret = process.env.TWITTER_CLIENT_SECRET;
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (clientSecret) headers['Authorization'] = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+
+  const r = await fetch('https://api.twitter.com/2/oauth2/token', {
+    method: 'POST',
+    headers,
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId }),
+  });
+  const data = await r.json();
+  if (!r.ok || !data.access_token) throw new Error(data.error_description || data.error || 'Token yenilenemedi.');
+  return { accessToken: data.access_token, refreshToken: data.refresh_token || refreshToken };
+}
+
+// Send tweet (supports OAuth 1.0a, OAuth 2.0 Bearer with auto-refresh)
 app.post('/api/twitter/send', async (req, res) => {
-  const { consumerKey, consumerSecret, accessToken, accessTokenSecret, text } = req.body;
+  const { consumerKey, consumerSecret, accessToken, accessTokenSecret, refreshToken, text } = req.body;
   if (!text) return res.status(400).json({ success: false, error: 'text gerekli.' });
   if (!accessToken) return res.status(400).json({ success: false, error: 'accessToken gerekli.' });
 
-  try {
-    const url = 'https://api.twitter.com/2/tweets';
-    let authHeader = '';
+  const url = 'https://api.twitter.com/2/tweets';
+  const isOAuth1 = !!(consumerKey && consumerSecret && accessTokenSecret);
 
-    if (consumerKey && consumerSecret && accessTokenSecret) {
-      authHeader = buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
-    } else {
-      authHeader = `Bearer ${accessToken}`;
-    }
-
+  const post = async (token) => {
+    const authHeader = isOAuth1
+      ? buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret)
+      : `Bearer ${token}`;
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: authHeader },
       body: JSON.stringify({ text }),
     });
-    const data = await r.json();
-    if (r.ok && data.data?.id) return res.json({ success: true, tweetId: data.data.id });
+    return { status: r.status, data: await r.json().catch(() => ({})) };
+  };
+
+  try {
+    let { status, data } = await post(accessToken);
+    let refreshedTokens = null;
+
+    if (status === 401 && !isOAuth1 && refreshToken) {
+      try {
+        refreshedTokens = await refreshTwitterOAuth2Token(refreshToken);
+        ({ status, data } = await post(refreshedTokens.accessToken));
+      } catch (refreshErr) {
+        return res.status(401).json({
+          success: false,
+          error: 'Twitter oturumunun süresi doldu ve otomatik yenileme başarısız oldu: ' + refreshErr.message + ' — Hesaplar sekmesinden Twitter\'ı OAuth ile yeniden bağla.',
+        });
+      }
+    }
+
+    if (status >= 200 && status < 300 && data.data?.id) {
+      return res.json({ success: true, tweetId: data.data.id, ...(refreshedTokens ? { refreshedTokens } : {}) });
+    }
     return res.status(400).json({ success: false, error: JSON.stringify(data.errors || data.detail || data) });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
@@ -639,9 +676,12 @@ app.post('/api/dispatch', async (req, res) => {
           r = await fetch(`${base}/api/twitter/free-send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cookies: c.cookies, text }) });
         } else {
           // OAuth 1.0a: use consumerKey + accessToken, or OAuth2 bearer accessToken
-          r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, text }) });
+          r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, refreshToken: c.refreshToken, text }) });
         }
         result = await r.json();
+        // OAuth2 tokens auto-rotate on refresh — hand the new ones back so
+        // the caller (frontend account state) doesn't keep using dead ones.
+        if (result.refreshedTokens) result.updatedCredentials = result.refreshedTokens;
       } else if (acc.platform === 'whatsapp') {
         r = await fetch(`${base}/api/whatsapp/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessToken: c.accessToken, phoneNumberId: c.phoneNumberId, recipientPhone: c.recipientPhone, text, mediaUrl }) });
         result = await r.json();
@@ -751,7 +791,7 @@ async function executeSyncRule(rule, message, twitterAccounts) {
       const endpoint = c.cookies?.length ? 'free-send' : 'send';
       const body = c.cookies?.length
         ? { cookies: c.cookies, text }
-        : { consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, text };
+        : { consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, refreshToken: c.refreshToken, text };
       const r = await fetch(`http://localhost:${PORT}/api/twitter/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -760,6 +800,15 @@ async function executeSyncRule(rule, message, twitterAccounts) {
       const d = await r.json();
       console.log(`[Sync] Rule "${rule.title}" → Twitter @${twAcc.username}: ${d.success ? '✅' : '❌ ' + d.error}`);
       results.push({ account: twAcc.name, success: !!d.success, error: d.error });
+
+      // Persist rotated OAuth2 tokens back into the stored rule so the next
+      // auto-sync (and the next server restart, via disk) uses the live one
+      // instead of the one that just expired.
+      if (d.refreshedTokens) {
+        twAcc.credentials.accessToken = d.refreshedTokens.accessToken;
+        twAcc.credentials.refreshToken = d.refreshedTokens.refreshToken;
+        saveState();
+      }
     } catch (e) {
       console.error('[Sync] Twitter post error:', e.message);
       results.push({ account: twAcc.name, success: false, error: e.message });
