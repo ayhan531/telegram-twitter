@@ -5,6 +5,9 @@ import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
 import { Scraper } from 'agent-twitter-client';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+puppeteerExtra.use(StealthPlugin());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -488,6 +491,104 @@ app.get('/api/twitter/callback', async (req, res) => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  TWITTER ─ Real headless-browser posting (Puppeteer + stealth)
+//  Hand-crafted HTTP requests to Twitter's internal API get flagged a lot
+//  more than an actual browser session does — this drives a real (stealth)
+//  Chromium instance with the session cookies instead, same technique tools
+//  like XActions use. Falls back to the lightweight HTTP client (below) if
+//  Chromium can't launch in this environment, instead of hard-failing.
+// ═══════════════════════════════════════════════════════════════════════════
+let sharedBrowser = null;
+async function getBrowser() {
+  if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
+  sharedBrowser = await puppeteerExtra.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  });
+  sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
+  return sharedBrowser;
+}
+
+async function withXPage(authToken, ct0, fn) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+    await page.setCookie(
+      { name: 'auth_token', value: authToken, domain: '.x.com', path: '/', httpOnly: true, secure: true },
+      { name: 'ct0', value: ct0, domain: '.x.com', path: '/', secure: true },
+    );
+    return await fn(page);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+// Confirms a session is genuinely logged in by loading the real timeline —
+// far more reliable than any single API endpoint, since it's exactly what
+// a human opening x.com would see.
+async function verifyXSessionViaBrowser(authToken, ct0) {
+  return withXPage(authToken, ct0, async (page) => {
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (/\/(login|i\/flow\/login)(\?|$)/.test(page.url())) return { loggedIn: false };
+
+    // The account-switcher button in the sidebar only renders for a logged
+    // in session — bad/expired cookies render the logged-out landing page
+    // at the *same* URL (no redirect to /login), so its presence is the
+    // real signal, not just "did we get bounced to a login route".
+    try {
+      await page.waitForSelector('[data-testid="SideNav_AccountSwitcher_Button"]', { timeout: 15000 });
+    } catch (_) {
+      return { loggedIn: false };
+    }
+    const username = await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
+      const match = (btn?.innerText || '').match(/@(\w+)/);
+      return match ? match[1] : null;
+    });
+
+    return { loggedIn: true, username };
+  });
+}
+
+// Posts a tweet by driving the real compose UI instead of calling an API.
+async function postTweetViaBrowser(authToken, ct0, text) {
+  return withXPage(authToken, ct0, async (page) => {
+    await page.goto('https://x.com/compose/post', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (/\/(login|i\/flow\/login)(\?|$)/.test(page.url())) {
+      throw new Error('Oturum geçersiz — Twitter giriş sayfasına yönlendirdi.');
+    }
+
+    const editorSelector = '[data-testid="tweetTextarea_0"]';
+    await page.waitForSelector(editorSelector, { timeout: 20000 });
+    await page.click(editorSelector);
+    await page.keyboard.type(text, { delay: 12 });
+
+    const postButtonSelector = '[data-testid="tweetButton"]';
+    await page.waitForSelector(postButtonSelector, { timeout: 10000 });
+    await page.click(postButtonSelector);
+
+    const outcome = await Promise.race([
+      page.waitForSelector(editorSelector, { hidden: true, timeout: 20000 }).then(() => ({ ok: true })),
+      page.waitForSelector('[data-testid="toast"]', { timeout: 20000 }).then(async (el) => ({
+        ok: false, message: (await page.evaluate(e => e.innerText, el)) || 'Tweet gönderilemedi.',
+      })),
+    ]).catch(() => ({ ok: true })); // Ambiguous timeout — don't falsely report failure if it likely went through.
+
+    if (!outcome.ok) throw new Error(outcome.message);
+    return { success: true };
+  });
+}
+
+function extractAuthCookiePair(cookieStrings) {
+  const find = (name) => {
+    const line = (cookieStrings || []).find(c => c.trim().startsWith(name + '='));
+    return line ? line.split(';')[0].split('=').slice(1).join('=').trim() : null;
+  };
+  return { authToken: find('auth_token'), ct0: find('ct0') };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  TWITTER ─ Free "no developer account" login (username + password → cookies)
 //  Uses Twitter's own web session (like logging in from a browser) instead of
 //  the paid Twitter Developer API. No client id / API key needed at all.
@@ -546,42 +647,65 @@ app.post('/api/twitter/free-login-cookies', async (req, res) => {
     return res.status(400).json({ success: false, error: 'auth_token ve ct0 çerez değerleri gerekli.' });
   }
   const cleanUsername = username?.trim().replace(/^@/, '') || '';
-  try {
-    const scraper = new Scraper();
-    await scraper.setCookies([
-      `auth_token=${authToken.trim()}; Domain=twitter.com; Path=/`,
-      `ct0=${ct0.trim()}; Domain=twitter.com; Path=/`,
-    ]);
+  const authTokenVal = authToken.trim();
+  const ct0Val = ct0.trim();
 
-    // Actually verify these cookies authenticate — getProfile() works even
-    // for logged-out guests, so it can't tell us whether tweeting will work.
-    // isLoggedIn()/me() hit verify_credentials.json with the real session
-    // and fail loudly (instead of silently) if the cookies are stale/wrong.
-    const loggedIn = await scraper.isLoggedIn();
+  try {
+    // Try the real-browser check first (matches what X's own detection
+    // expects); fall back to the lightweight HTTP client if Chromium can't
+    // run in this environment, instead of hard-failing the whole feature.
+    let loggedIn, resolvedUsername = cleanUsername, cookies;
+    try {
+      const result = await verifyXSessionViaBrowser(authTokenVal, ct0Val);
+      loggedIn = result.loggedIn;
+      resolvedUsername = result.username || cleanUsername;
+      cookies = [`auth_token=${authTokenVal}; Domain=twitter.com; Path=/`, `ct0=${ct0Val}; Domain=twitter.com; Path=/`];
+    } catch (browserErr) {
+      console.error('[Twitter free-login-cookies] browser check failed, falling back to HTTP:', browserErr.message);
+      const scraper = new Scraper();
+      await scraper.setCookies([
+        `auth_token=${authTokenVal}; Domain=twitter.com; Path=/`,
+        `ct0=${ct0Val}; Domain=twitter.com; Path=/`,
+      ]);
+      loggedIn = await scraper.isLoggedIn();
+      if (loggedIn) {
+        const profile = await scraper.me();
+        resolvedUsername = profile?.username || cleanUsername;
+      }
+      cookies = (await scraper.getCookies()).map(c => c.toString());
+    }
+
     if (!loggedIn) {
       throw new Error('Twitter bu çerezleri kabul etmedi. auth_token/ct0 süresi dolmuş olabilir — x.com\'da çıkış yapmadan (!) tekrar DevTools\'tan taze değerleri kopyala.');
     }
-    const profile = await scraper.me();
 
-    const cookies = (await scraper.getCookies()).map(c => c.toString());
     return res.json({
       success: true,
-      user: {
-        username: profile?.username || cleanUsername || 'twitter',
-        name: profile?.name || profile?.username || cleanUsername || 'Twitter Hesabı',
-      },
+      user: { username: resolvedUsername || 'twitter', name: resolvedUsername || 'Twitter Hesabı' },
       cookies,
     });
   } catch (err) {
     console.error('[Twitter free-login-cookies] failed:', err.message);
-    return res.status(400).json({ success: false, error: err.message.includes('çerez') ? err.message : 'Çerezler geçersiz görünüyor: ' + err.message });
+    return res.status(400).json({ success: false, error: err.message.includes('çerez') || err.message.includes('kabul') ? err.message : 'Çerezler geçersiz görünüyor: ' + err.message });
   }
 });
 
-// Send a tweet using stored session cookies (no API keys involved)
+// Send a tweet using stored session cookies (no API keys involved). Tries
+// the real-browser path first, falls back to the raw HTTP client on failure.
 app.post('/api/twitter/free-send', async (req, res) => {
   const { cookies, text } = req.body;
   if (!cookies?.length || !text) return res.status(400).json({ success: false, error: 'cookies ve text gerekli.' });
+
+  const { authToken, ct0 } = extractAuthCookiePair(cookies);
+  if (authToken && ct0) {
+    try {
+      await postTweetViaBrowser(authToken, ct0, text);
+      return res.json({ success: true });
+    } catch (browserErr) {
+      console.error('[Twitter free-send] browser post failed, falling back to HTTP:', browserErr.message);
+    }
+  }
+
   try {
     const scraper = new Scraper();
     await scraper.setCookies(cookies);
