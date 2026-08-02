@@ -389,33 +389,17 @@ app.post('/api/twitter/cookie-verify', async (req, res) => {
   cookieArray = prepared.cookieStrings;
 
   try {
-    const scraper = new Scraper();
-    await scraper.setCookies(cookieArray);
-    try { await scraper.auth.updateGuestToken(); } catch (_) {}
-
-    let username = null;
-    try {
-      const me = await scraper.getMe();
-      if (me?.username) username = me.username;
-    } catch (e) {
-      console.warn('[Twitter] getMe hatası:', e.message);
+    const verified = await verifyTwitterCookies(prepared.cookieMap);
+    if (verified.error) {
+      return res.status(400).json({ success: false, error: verified.error });
     }
 
-    const isLoggedIn = await scraper.isLoggedIn().catch(() => false);
-
-    if (!username && !isLoggedIn) {
-      return res.status(400).json({
-        success: false,
-        error: 'Çerezler Twitter tarafından kabul edilmedi. auth_token süresi dolmuş olabilir — x.com\'da oturumu açıp auth_token ve ct0 değerlerini yeniden kopyalayın.',
-      });
-    }
-
+    console.log(`[Twitter] Hesap doğrulandı: @${verified.username}`);
     return res.json({
       success: true,
-      user: { username: username || 'Twitter Hesabı', name: username || 'Twitter Hesabı' },
+      user: { username: verified.username, name: verified.name },
       cookies: cookieArray,
     });
-
   } catch (err) {
     return res.status(400).json({ success: false, error: 'Çerez doğrulama hatası: ' + err.message });
   }
@@ -481,6 +465,45 @@ async function fetchCt0(authToken) {
   return null;
 }
 
+// Çerezleri doğrudan verify_credentials'a sorar. Kütüphanenin me()/isLoggedIn()
+// sarmalayıcıları hatayı yutuyor; burada Twitter'ın gerçek kodunu görebiliyoruz.
+async function verifyTwitterCookies(cookieMap) {
+  const cookieHeader = [...cookieMap.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+  const r = await fetch('https://api.twitter.com/1.1/account/verify_credentials.json', {
+    headers: {
+      authorization: `Bearer ${TWITTER_BEARER}`,
+      cookie: cookieHeader,
+      'x-csrf-token': cookieMap.get('ct0') || '',
+      'x-twitter-auth-type': 'OAuth2Session',
+      'x-twitter-active-user': 'yes',
+      'x-twitter-client-language': 'en',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+    },
+  });
+  const body = await r.text();
+  let data = null;
+  try { data = JSON.parse(body); } catch (_) {}
+
+  if (r.ok && data?.screen_name) {
+    return { username: data.screen_name, name: data.name || data.screen_name };
+  }
+
+  const code = data?.errors?.[0]?.code;
+  const twMsg = data?.errors?.[0]?.message || body.slice(0, 200);
+  console.error(`[Twitter] verify_credentials başarısız (HTTP ${r.status}, kod ${code}):`, twMsg);
+
+  if (code === 32) {
+    return { error: 'Twitter oturumu tanımadı (Hata 32). auth_token geçersiz veya süresi dolmuş. x.com\'da oturum açıp auth_token ve ct0 değerlerini yeniden kopyalayın.' };
+  }
+  if (code === 353 || r.status === 403) {
+    return { error: 'CSRF doğrulaması başarısız (ct0). auth_token ile ct0 aynı oturuma ait olmalı — ikisini de aynı anda x.com çerezlerinden kopyalayın.' };
+  }
+  if (code === 326) {
+    return { error: 'Twitter hesabı geçici olarak kilitli. x.com\'a girip doğrulamayı tamamlayın, sonra çerezleri yeniden alın.' };
+  }
+  return { error: `Twitter doğrulaması başarısız (HTTP ${r.status}): ${twMsg}` };
+}
+
 // auth_token + gerçek ct0 içeren, tweet atmaya hazır çerez listesi üretir.
 async function prepareTwitterCookies(cookies) {
   const jar = parseCookieMap(cookies);
@@ -495,7 +518,7 @@ async function prepareTwitterCookies(cookies) {
     }
     jar.set('ct0', ct0);
   }
-  return { cookieStrings: toCookieStrings(jar) };
+  return { cookieStrings: toCookieStrings(jar), cookieMap: jar };
 }
 
 async function postTweetViaCookies(cookies, text, mediaData = []) {
