@@ -30,24 +30,30 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
     return () => clearInterval(pollRef.current);
   }, []);
 
-  // ── Twitter Verification (XActions auth_token OR API keys) ──
+  // ── Twitter Verification (XActions auth_token / x-use Cookie-Editor OR API keys) ──
+  const [cookieJson, setCookieJson] = useState('');
+
   const handleVerifyTwitter = async () => {
     setTwStatus('loading');
     setTwError('');
 
     try {
-      if (twTab === 'auth_token') {
-        if (!authToken.trim()) {
+      if (twTab === 'auth_token' || twTab === 'cookie_json') {
+        const payload = twTab === 'cookie_json'
+          ? { cookieJson: cookieJson.trim() }
+          : { cookies: [`auth_token=${authToken.trim()}`], authToken: authToken.trim() };
+
+        if (twTab === 'auth_token' && !authToken.trim()) {
           throw new Error('Lütfen x.com hesabınızdan aldığınız auth_token değerini girin.');
+        }
+        if (twTab === 'cookie_json' && !cookieJson.trim()) {
+          throw new Error('Lütfen Cookie-Editor eklentisinden kopyaladığınız JSON çerez metnini yapıştırın.');
         }
 
         const res = await fetch('/api/twitter/cookie-verify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            cookies: [`auth_token=${authToken.trim()}`],
-            authToken: authToken.trim(),
-          }),
+          body: JSON.stringify(payload),
         });
         const data = await res.json();
         if (!data.success) throw new Error(data.error);
@@ -61,13 +67,14 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           status: 'connected',
           avatarColor: 'bg-neutral-800',
           credentials: {
-            cookies: data.cookies || [`auth_token=${authToken.trim()}`],
-            authToken: authToken.trim(),
+            cookies: data.cookies,
+            authToken: authToken.trim() || null,
           },
         };
 
-        setAccounts(prev => [...prev.filter(a => a.platform !== 'twitter'), newAccount]);
-        onShowToast(`Twitter hesabı (${username}) Sınırsız Mod ile bağlandı! 🎉`, 'success');
+        // Allow multi-account adding (filter only duplicate username)
+        setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
+        onShowToast(`Twitter hesabı (${username}) bağlandı! 🎉`, 'success');
         setTimeout(() => setActiveModal(null), 1200);
 
       } else {
@@ -105,7 +112,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           },
         };
 
-        setAccounts(prev => [...prev.filter(a => a.platform !== 'twitter'), newAccount]);
+        setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
         onShowToast(`Twitter hesabı (${username}) bağlandı!`, 'success');
         setTimeout(() => setActiveModal(null), 1200);
       }
@@ -409,26 +416,35 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
             </div>
 
             {/* Mode Switcher Tabs */}
-            <div className="grid grid-cols-2 gap-2 p-1 bg-slate-950 rounded-xl border border-slate-800">
+            <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-950 rounded-xl border border-slate-800">
               <button
                 onClick={() => setTwTab('auth_token')}
-                className={`py-2 rounded-lg text-xs font-bold transition flex items-center justify-center space-x-1.5 ${
+                className={`py-2 rounded-lg text-[11px] font-bold transition flex items-center justify-center space-x-1 ${
                   twTab === 'auth_token'
                     ? 'bg-emerald-600 text-white shadow-md'
                     : 'text-slate-400 hover:text-white'
                 }`}>
-                <ShieldCheck size={14} />
-                <span>XActions (Sınırsız & Ücretsiz)</span>
+                <ShieldCheck size={13} />
+                <span>auth_token</span>
+              </button>
+              <button
+                onClick={() => setTwTab('cookie_json')}
+                className={`py-2 rounded-lg text-[11px] font-bold transition flex items-center justify-center space-x-1 ${
+                  twTab === 'cookie_json'
+                    ? 'bg-sky-600 text-white shadow-md'
+                    : 'text-slate-400 hover:text-white'
+                }`}>
+                <span>x-use JSON</span>
               </button>
               <button
                 onClick={() => setTwTab('api_keys')}
-                className={`py-2 rounded-lg text-xs font-bold transition flex items-center justify-center space-x-1.5 ${
+                className={`py-2 rounded-lg text-[11px] font-bold transition flex items-center justify-center space-x-1 ${
                   twTab === 'api_keys'
                     ? 'bg-indigo-600 text-white shadow-md'
                     : 'text-slate-400 hover:text-white'
                 }`}>
-                <Key size={14} />
-                <span>API Keys (Developer Portal)</span>
+                <Key size={13} />
+                <span>API Keys</span>
               </button>
             </div>
 
@@ -460,6 +476,31 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                     onChange={e => setAuthToken(e.target.value)}
                     placeholder="Örn: 6a7f8e9d0c1b2a3f..."
                     className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-emerald-500/30 focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* MODE 2: x-use Cookie-Editor JSON */}
+            {twTab === 'cookie_json' && (
+              <div className="space-y-4">
+                <div className="p-4 rounded-xl bg-sky-950/30 border border-sky-500/30 text-xs text-sky-200 space-y-2 leading-relaxed">
+                  <p className="font-bold text-sky-300 flex items-center space-x-1.5 text-sm">
+                    <span>🍪 x-use Yöntemi (Cookie-Editor JSON Aktarımı)</span>
+                  </p>
+                  <p><strong>x-use</strong> projesinin kullandığı tarayıcı çerez aktarım yöntemi. Chrome/Edge <i>Cookie-Editor</i> eklentisinden **Export JSON** diyerek aldığınız çerez metnini doğrudan buraya yapıştırabilirsiniz.</p>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
+                    Cookie-Editor JSON Çerez Metni
+                  </label>
+                  <textarea
+                    rows={5}
+                    value={cookieJson}
+                    onChange={e => setCookieJson(e.target.value)}
+                    placeholder='[{"domain":".x.com","name":"auth_token","value":"..."}, ...]'
+                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
                   />
                 </div>
               </div>

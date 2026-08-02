@@ -340,15 +340,33 @@ app.post('/api/twitter/free-login', async (req, res) => {
 });
 
 app.post('/api/twitter/cookie-verify', async (req, res) => {
-  const { cookies, authToken, ct0 } = req.body;
+  const { cookies, authToken, cookieJson } = req.body;
   
   let cookieArray = [];
-  if (Array.isArray(cookies) && cookies.length) {
+
+  // Support x-use Cookie-Editor JSON format
+  if (cookieJson) {
+    try {
+      const parsed = typeof cookieJson === 'string' ? JSON.parse(cookieJson) : cookieJson;
+      if (Array.isArray(parsed)) {
+        cookieArray = parsed.map(c => {
+          if (typeof c === 'string') return c;
+          if (c.name && c.value) return `${c.name}=${c.value}`;
+          if (c.key && c.value) return `${c.key}=${c.value}`;
+          return String(c);
+        });
+      }
+    } catch (_) {}
+  }
+  
+  if (!cookieArray.length && Array.isArray(cookies) && cookies.length) {
     cookieArray = cookies;
-  } else if (authToken && ct0) {
-    cookieArray = [`auth_token=${authToken.trim()}`, `ct0=${ct0.trim()}`];
-  } else {
-    return res.status(400).json({ success: false, error: 'Lütfen çerezlerinizi (auth_token ve ct0) veya cookie dizisini girin.' });
+  } else if (!cookieArray.length && authToken) {
+    cookieArray = [`auth_token=${authToken.trim()}`];
+  }
+
+  if (!cookieArray.length) {
+    return res.status(400).json({ success: false, error: 'Lütfen x-use Cookie-Editor JSON verisini veya auth_token değerini girin.' });
   }
 
   try {
