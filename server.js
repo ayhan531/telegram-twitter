@@ -381,6 +381,11 @@ app.post('/api/twitter/cookie-verify', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Lütfen auth_token veya çerez bilgilerinizi girin.' });
   }
 
+  cookieArray = normalizeTwitterCookies(cookieArray);
+  if (!cookieArray.some(c => c.startsWith('auth_token='))) {
+    return res.status(400).json({ success: false, error: 'Çerezler içinde auth_token bulunamadı. Lütfen x.com çerezlerinden auth_token değerini girin.' });
+  }
+
   try {
     const scraper = new Scraper();
     await scraper.setCookies(cookieArray);
@@ -415,14 +420,67 @@ app.post('/api/twitter/cookie-verify', async (req, res) => {
   }
 });
 
-async function postTweetViaCookies(cookies, text) {
+// agent-twitter-client çerezleri "https://twitter.com" host-only olarak kaydediyor,
+// ancak tweet/medya istekleri api.twitter.com ve upload.twitter.com'a gidiyor.
+// Domain=.twitter.com eklenmezse çerezler o isteklere hiç eklenmez ve tweet atılamaz.
+// Ayrıca ct0 yoksa x-csrf-token başlığı boş kalır (403). ct0 istemci üretimli bir
+// değerdir; sunucu sadece cookie == header eşleşmesine bakar, o yüzden yoksa üretiriz.
+function normalizeTwitterCookies(input) {
+  const arr = Array.isArray(input) ? input : [input];
+  const jar = new Map();
+  for (const raw of arr) {
+    if (!raw) continue;
+    let str;
+    if (typeof raw === 'string') str = raw;
+    else if (raw.key && raw.value != null) str = `${raw.key}=${raw.value}`;
+    else if (raw.name && raw.value != null) str = `${raw.name}=${raw.value}`;
+    else str = String(raw);
+    const first = str.split(';')[0].trim();
+    const eq = first.indexOf('=');
+    if (eq < 1) continue;
+    const key = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1).trim();
+    if (key && value) jar.set(key, value);
+  }
+  if (jar.has('auth_token') && !jar.has('ct0')) {
+    jar.set('ct0', crypto.randomBytes(16).toString('hex'));
+  }
+  return [...jar.entries()].map(([k, v]) => `${k}=${v}; Domain=.twitter.com; Path=/; Secure; SameSite=None`);
+}
+
+async function postTweetViaCookies(cookies, text, mediaData = []) {
   try {
     const scraper = new Scraper();
-    await scraper.setCookies(cookies);
-    const res = await scraper.sendTweet(text);
-    return { success: true, res };
+    await scraper.setCookies(normalizeTwitterCookies(cookies));
+    const res = await scraper.sendTweet(text, undefined, mediaData.length ? mediaData : undefined);
+
+    if (!res) {
+      return { success: false, error: 'Twitter yanıt vermedi.' };
+    }
+
+    let data = null;
+    try {
+      if (typeof res.json === 'function') {
+        data = await res.json();
+      } else {
+        data = res;
+      }
+    } catch (_) {
+      data = res;
+    }
+
+    if (data?.errors && data.errors.length > 0) {
+      const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
+      console.error('[Twitter] Cookie tweet hatası:', errMsg);
+      return { success: false, error: errMsg };
+    }
+
+    const tweetId = data?.data?.create_tweet?.tweet_results?.result?.rest_id || data?.id;
+    console.log('[Twitter] Cookie tweet başarılı! Tweet ID:', tweetId || 'ok');
+    return { success: true, tweetId: tweetId || null };
   } catch (err) {
-    return { success: false, error: err.message };
+    console.error('[Twitter] Cookie tweet istisna:', err.message);
+    return { success: false, error: err.message || String(err) };
   }
 }
 
@@ -594,6 +652,39 @@ function buildTweetText(rawText, rule) {
   return text;
 }
 
+// ─── Telegram Media → Twitter Media ─────────────────────────────────────────
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;   // Twitter görsel limiti
+const MAX_VIDEO_BYTES = 512 * 1024 * 1024; // Twitter video limiti
+
+async function extractTelegramMedia(msg) {
+  try {
+    if (!msg?.media) return [];
+    if (msg.media.className === 'MessageMediaWebPage') return []; // link önizlemesi, indirme
+    let mediaType = null;
+    if (msg.photo) mediaType = 'image/jpeg';
+    else if (msg.gif) mediaType = 'video/mp4';
+    else if (msg.video || msg.videoNote) mediaType = 'video/mp4';
+    else if (msg.document?.mimeType?.startsWith('image/')) mediaType = msg.document.mimeType;
+    else if (msg.document?.mimeType?.startsWith('video/')) mediaType = msg.document.mimeType;
+    if (!mediaType) return [];
+
+    console.log(`[Media] Telegram medyası indiriliyor (${mediaType})...`);
+    const buf = await msg.downloadMedia();
+    if (!buf || !buf.length) return [];
+
+    const limit = mediaType.startsWith('image/') ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES;
+    if (buf.length > limit) {
+      console.warn(`[Media] Medya Twitter boyut limitini aşıyor (${buf.length} bayt), atlanıyor.`);
+      return [];
+    }
+    console.log(`[Media] Medya indirildi: ${(buf.length / 1024).toFixed(0)} KB`);
+    return [{ data: Buffer.from(buf), mediaType }];
+  } catch (e) {
+    console.error('[Media] Telegram medya indirme hatası:', e.message);
+    return [];
+  }
+}
+
 // ─── Telegram Listener Engine ───────────────────────────────────────────────
 async function startTelegramListener(accountId) {
   const sess = tgActiveSessions.get(accountId);
@@ -672,14 +763,28 @@ async function executeSyncRule(rule, message, twitterAccounts) {
 
   const rawText = message.text || message.caption || '';
   const text = buildTweetText(rawText, rule);
+  const media = await extractTelegramMedia(message);
 
-  if (!text) {
+  // Metin yoksa ama görsel/video varsa yine de tweet at; yalnızca
+  // yasaklı kelimeye takılan veya tamamen boş mesajları filtrele.
+  if (!text && !media.length) {
     pushSyncLog({
       source: `Telegram → ${rule.title}`,
       messagePreview: (rawText || '(boş mesaj)').slice(0, 80),
       targets: (twitterAccounts || []).map(a => a.name),
       status: 'filtered',
-      details: rawText.trim() ? 'Yasaklı kelime filtresine takıldı.' : 'Mesajda metin yok.',
+      details: rawText.trim() ? 'Yasaklı kelime filtresine takıldı.' : 'Mesajda metin ve medya yok.',
+    });
+    return;
+  }
+  if (!text && rawText.trim()) {
+    // Metin yasaklı kelimeye takıldıysa medya olsa bile gönderme
+    pushSyncLog({
+      source: `Telegram → ${rule.title}`,
+      messagePreview: rawText.slice(0, 80),
+      targets: (twitterAccounts || []).map(a => a.name),
+      status: 'filtered',
+      details: 'Yasaklı kelime filtresine takıldı.',
     });
     return;
   }
@@ -700,11 +805,15 @@ async function executeSyncRule(rule, message, twitterAccounts) {
     const c = twAcc.credentials || {};
     try {
       if (Array.isArray(c.cookies) && c.cookies.length > 0) {
-        // Free & Unlimited Cookie Mode
-        const freeRes = await postTweetViaCookies(c.cookies, text);
+        // Free & Unlimited Cookie Mode (görsel/video dahil)
+        const freeRes = await postTweetViaCookies(c.cookies, text, media);
         results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
       } else if (c.consumerKey && c.consumerSecret) {
-        // Official API Key Mode
+        // Official API Key Mode (yalnızca metin; medya çerez modunda destekleniyor)
+        if (!text) {
+          results.push({ account: twAcc.name, success: false, error: 'Görsel/video paylaşımı yalnızca çerez (auth_token) modunda destekleniyor.' });
+          continue;
+        }
         const url = 'https://api.twitter.com/2/tweets';
         const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
         const r = await fetch(url, {
@@ -726,7 +835,7 @@ async function executeSyncRule(rule, message, twitterAccounts) {
   const failCount = results.filter(r => !r.success).length;
   pushSyncLog({
     source: `Telegram → ${rule.title}`,
-    messagePreview: text.slice(0, 80),
+    messagePreview: (text || '📷 Medya paylaşımı').slice(0, 80) + (media.length ? ' [+medya]' : ''),
     targets: twitterAccounts.map(a => a.name),
     status: failCount === 0 ? 'success' : (failCount === results.length ? 'error' : 'partial'),
     details: results.map(r => `${r.account}: ${r.success ? '✅ Gönderildi' : '❌ ' + (r.error || 'Hata')}`).join(' · '),
