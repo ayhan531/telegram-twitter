@@ -4,55 +4,40 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
-import { Scraper } from 'agent-twitter-client';
-import puppeteerExtra from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-puppeteerExtra.use(StealthPlugin());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.set('trust proxy', 1); // Render terminates TLS upstream; trust X-Forwarded-Proto so req.protocol is 'https'
-
-// ─── Server-side credentials (set in Render Environment Variables) ──────────
-// TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET
-// TELEGRAM_API_ID,   TELEGRAM_API_HASH
-// These are NEVER exposed to the frontend.
+app.set('trust proxy', 1); // Trust Render TLS proxy
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ─── In-memory stores ────────────────────────────────────────────────────────
-const twitterOAuthSessions = new Map();
-const tgQRSessions        = new Map();
-const tgActiveSessions    = new Map(); // accountId -> { client, sessionString, accountName }
-const syncRulesStore      = new Map(); // ruleId -> rule object
-const recentlySynced      = new Set(); // messageId -> to prevent double-posting
-const syncLog             = [];        // audit trail for auto-sync attempts (Telegram msg -> Twitter etc.)
+const tgQRSessions     = new Map();
+const tgActiveSessions = new Map(); // accountId -> { client, sessionString, accountName, apiId, apiHash }
+const syncRulesStore   = new Map(); // ruleId -> rule object
+const recentlySynced   = new Set(); // messageId -> to prevent duplicate tweets
+const syncLog          = [];        // audit trail for auto-sync activity
 
 // ─── Disk persistence ────────────────────────────────────────────────────────
-// So a plain server restart (crash, redeploy) doesn't force the user to
-// reconnect Telegram/rescan a QR — the frontend heartbeat covers the case
-// where a browser tab is open, this covers it even when no one is looking.
-// On Render this survives restarts of the same instance; it only survives a
-// full redeploy too if DATA_DIR points at an attached persistent Disk.
 const DATA_DIR   = process.env.DATA_DIR || path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 function saveState() {
   try {
-    // This file holds Telegram session strings and Twitter session cookies
-    // in the clear — restrict it to the owning process's user only.
     fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
     const sessions = [...tgActiveSessions.values()].map(s => ({
-      accountId: s.accountId, accountName: s.accountName,
-      sessionString: s.sessionString, apiId: s.apiId, apiHash: s.apiHash,
+      accountId: s.accountId,
+      accountName: s.accountName,
+      sessionString: s.sessionString,
+      apiId: s.apiId,
+      apiHash: s.apiHash,
     }));
     const rules = [...syncRulesStore.values()];
     fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules }, null, 2), { mode: 0o600 });
-    fs.chmodSync(STATE_FILE, 0o600); // writeFileSync's mode only applies when creating the file, not on overwrite
   } catch (e) {
     console.error('[Persist] Failed to save state:', e.message);
   }
@@ -70,20 +55,64 @@ function loadState() {
 }
 
 function pushSyncLog(entry) {
-  syncLog.unshift({ id: `synclog-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, timestamp: new Date().toLocaleString('tr-TR'), ...entry });
+  syncLog.unshift({
+    id: `synclog-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: new Date().toLocaleString('tr-TR'),
+    ...entry
+  });
   if (syncLog.length > 200) syncLog.length = 200;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HEALTH + CONFIG (tells frontend which services are ready)
+//  TWITTER ─ OAuth 1.0a HMAC-SHA1 Signer (RFC 5849)
+// ═══════════════════════════════════════════════════════════════════════════
+function rfc3986Encode(str) {
+  return encodeURIComponent(str).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function buildOAuth1Header(method, targetUrl, consumerKey, consumerSecret, accessToken, accessTokenSecret) {
+  const urlObj = new URL(targetUrl);
+  const baseUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
+
+  const oauthParams = {
+    oauth_consumer_key:     consumerKey.trim(),
+    oauth_nonce:            crypto.randomBytes(16).toString('hex'),
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp:        Math.floor(Date.now() / 1000).toString(),
+    oauth_token:            accessToken.trim(),
+    oauth_version:          '1.0',
+  };
+
+  const allParams = { ...oauthParams };
+  urlObj.searchParams.forEach((val, key) => {
+    allParams[key] = val;
+  });
+
+  const paramString = Object.keys(allParams)
+    .sort()
+    .map(k => `${rfc3986Encode(k)}=${rfc3986Encode(allParams[k])}`)
+    .join('&');
+
+  const baseString = `${method.toUpperCase()}&${rfc3986Encode(baseUrl)}&${rfc3986Encode(paramString)}`;
+  const signingKey = `${rfc3986Encode(consumerSecret.trim())}&${rfc3986Encode(accessTokenSecret.trim())}`;
+  oauthParams.oauth_signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
+
+  return 'OAuth ' + Object.keys(oauthParams)
+    .sort()
+    .map(k => `${rfc3986Encode(k)}="${rfc3986Encode(oauthParams[k])}"`)
+    .join(', ');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HEALTH & CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'online', app: 'OmniSync Social', version: '3.2.0' });
+  res.json({ status: 'online', app: 'Telegram-Twitter AutoSync', version: '4.0.0' });
 });
 
 app.get('/api/config', async (_req, res) => {
   const telegramReady = true;
-  
+
   const ck  = process.env.TWITTER_CONSUMER_KEY || process.env.TWITTER_API_KEY;
   const cs  = process.env.TWITTER_CONSUMER_SECRET || process.env.TWITTER_API_SECRET;
   const at  = process.env.TWITTER_ACCESS_TOKEN;
@@ -107,66 +136,23 @@ app.get('/api/config', async (_req, res) => {
           credentials: { consumerKey: ck, consumerSecret: cs, accessToken: at, accessTokenSecret: ats }
         };
       }
-    } catch (e) {}
+    } catch (_) {}
   }
 
-  res.json({
-    telegramReady,
-    autoTwitterAccount,
-  });
-});
-
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM ─ BOT API (test + send)
-// ═══════════════════════════════════════════════════════════════════════════
-app.post('/api/telegram/test-bot', async (req, res) => {
-  const { botToken } = req.body;
-  if (!botToken) return res.status(400).json({ success: false, error: 'Bot Token gerekli.' });
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
-    const data = await r.json();
-    if (data.ok) return res.json({ success: true, botInfo: { id: data.result.id, name: data.result.first_name, username: `@${data.result.username}` } });
-    return res.status(400).json({ success: false, error: data.description || 'Geçersiz Bot Token' });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/telegram/send', async (req, res) => {
-  const { botToken, chatId, text, mediaUrl } = req.body;
-  if (!botToken || !chatId || !text) return res.status(400).json({ success: false, error: 'botToken, chatId ve text gerekli.' });
-  try {
-    const endpoint = mediaUrl
-      ? `https://api.telegram.org/bot${botToken}/sendPhoto`
-      : `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const payload = mediaUrl
-      ? { chat_id: chatId, photo: mediaUrl, caption: text }
-      : { chat_id: chatId, text };
-    const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    const data = await r.json();
-    if (data.ok) return res.json({ success: true, messageId: data.result.message_id });
-    return res.status(400).json({ success: false, error: data.description });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
+  res.json({ telegramReady, autoTwitterAccount });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM ─ QR LOGIN (gramjs user session)
+//  TELEGRAM ─ QR LOGIN & SESSION MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/api/telegram/qr/start', async (req, res) => {
-  // Prefer server env vars; fall back to body or standard Telegram app keys
   const apiId   = process.env.TELEGRAM_API_ID   || req.body.apiId   || '2040';
   const apiHash = process.env.TELEGRAM_API_HASH || req.body.apiHash || 'b18441a1ed607e10e4b39251a1319a14';
-
 
   const sessionId = crypto.randomBytes(16).toString('hex');
   const sessionData = { status: 'starting', qrDataUrl: null, sessionString: null, user: null, error: null };
   tgQRSessions.set(sessionId, sessionData);
 
-  // Lazy-load gramjs to avoid startup cost
   try {
     const { TelegramClient } = await import('teleproto');
     const { StringSession } = await import('teleproto/sessions/index.js');
@@ -180,7 +166,6 @@ app.post('/api/telegram/qr/start', async (req, res) => {
     await client.connect();
     sessionData.client = client;
 
-    // Start QR sign-in flow (async, fires callbacks)
     client.signInUserWithQrCode(
       { apiId: parseInt(apiId, 10), apiHash },
       {
@@ -196,8 +181,7 @@ app.post('/api/telegram/qr/start', async (req, res) => {
           }
         },
         password: async () => {
-          // 2FA: we can't handle interactively here, reject
-          throw new Error('2FA şifresi desteklenmiyor. Telegram > Ayarlar > Gizlilik > İki Adımlı Doğrulama\'yı geçici olarak kapatın.');
+          throw new Error('İki adımlı doğrulama (2FA) aktif. Lütfen Telegram Ayarlar > İki Adımlı Doğrulama\'yı kapatıp tekrar deneyin.');
         },
         onError: async (err) => {
           sessionData.error = err.message;
@@ -222,7 +206,6 @@ app.post('/api/telegram/qr/start', async (req, res) => {
       }
     });
 
-    // Wait up to 4s for first QR to be generated
     for (let i = 0; i < 40; i++) {
       if (sessionData.qrDataUrl || sessionData.status === 'error') break;
       await new Promise(r => setTimeout(r, 100));
@@ -232,14 +215,14 @@ app.post('/api/telegram/qr/start', async (req, res) => {
   } catch (err) {
     sessionData.status = 'error';
     sessionData.error = err.message;
-    return res.status(500).json({ success: false, error: 'gramjs yüklenemedi: ' + err.message });
+    return res.status(500).json({ success: false, error: 'Telegram bağlantı hatası: ' + err.message });
   }
 });
 
 app.get('/api/telegram/qr/poll', (req, res) => {
   const { sessionId } = req.query;
   const s = tgQRSessions.get(sessionId);
-  if (!s) return res.status(404).json({ success: false, error: 'Session bulunamadı.' });
+  if (!s) return res.status(404).json({ success: false, error: 'Oturum bulunamadı.' });
   return res.json({
     success: true,
     status: s.status,
@@ -250,594 +233,16 @@ app.get('/api/telegram/qr/poll', (req, res) => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ OAuth 1.0a (API Key + Access Token — no redirect needed)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Build OAuth 1.0a Authorization header (RFC 5849 compliant)
-function buildOAuth1Header(method, targetUrl, consumerKey, consumerSecret, accessToken, accessTokenSecret) {
-  const urlObj = new URL(targetUrl);
-  const baseUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
-
-  const oauthParams = {
-    oauth_consumer_key:     consumerKey.trim(),
-    oauth_nonce:            crypto.randomBytes(16).toString('hex'),
-    oauth_signature_method: 'HMAC-SHA1',
-    oauth_timestamp:        Math.floor(Date.now() / 1000).toString(),
-    oauth_token:            accessToken.trim(),
-    oauth_version:          '1.0',
-  };
-
-  const allParams = { ...oauthParams };
-  urlObj.searchParams.forEach((val, key) => {
-    allParams[key] = val;
-  });
-
-  const paramString = Object.keys(allParams)
-    .sort()
-    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
-    .join('&');
-
-  const baseString = `${method.toUpperCase()}&${encodeURIComponent(baseUrl)}&${encodeURIComponent(paramString)}`;
-  const signingKey = `${encodeURIComponent(consumerSecret.trim())}&${encodeURIComponent(accessTokenSecret.trim())}`;
-  oauthParams.oauth_signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
-
-  return 'OAuth ' + Object.keys(oauthParams)
-    .sort()
-    .map(k => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`)
-    .join(', ');
-}
-
-// Verify credentials and get user info
-app.post('/api/twitter/verify', async (req, res) => {
-  const { consumerKey, consumerSecret, accessToken, accessTokenSecret } = req.body;
-  if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret)
-    return res.status(400).json({ success: false, error: 'Tüm 4 alan gerekli.' });
-  try {
-    // Try v1.1 verify_credentials first
-    const url1 = 'https://api.twitter.com/1.1/account/verify_credentials.json';
-    const auth1 = buildOAuth1Header('GET', url1, consumerKey, consumerSecret, accessToken, accessTokenSecret);
-    const r1 = await fetch(url1, { headers: { Authorization: auth1 } });
-    const data1 = await r1.json();
-    
-    if (r1.ok && (data1.screen_name || data1.name)) {
-      return res.json({ success: true, user: { username: data1.screen_name, name: data1.name || data1.screen_name } });
-    }
-
-    // Fallback: try v2 users/me
-    const url2 = 'https://api.twitter.com/2/users/me';
-    const auth2 = buildOAuth1Header('GET', url2, consumerKey, consumerSecret, accessToken, accessTokenSecret);
-    const r2 = await fetch(url2, { headers: { Authorization: auth2 } });
-    const data2 = await r2.json();
-
-    if (r2.ok && data2.data?.id) {
-      return res.json({ success: true, user: data2.data });
-    }
-
-    const errDetail = (data1.errors && data1.errors[0]?.message) || data2.detail || data2.title || JSON.stringify(data1 || data2);
-    return res.status(400).json({ success: false, error: errDetail });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// OAuth 2.0 access tokens expire after ~2h. We requested the
-// `offline.access` scope at login time specifically so we'd get a
-// refresh_token back — use it to silently mint a new access token instead
-// of the automation quietly dying every couple of hours.
-async function refreshTwitterOAuth2Token(refreshToken) {
-  const clientId     = process.env.TWITTER_CLIENT_ID || 'UXdLRTNQNmxTVW1Fc1pwWVVmVmI6MTpjaQ';
-  const clientSecret = process.env.TWITTER_CLIENT_SECRET;
-  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-  if (clientSecret) headers['Authorization'] = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
-
-  const r = await fetch('https://api.twitter.com/2/oauth2/token', {
-    method: 'POST',
-    headers,
-    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId }),
-  });
-  const data = await r.json();
-  if (!r.ok || !data.access_token) throw new Error(data.error_description || data.error || 'Token yenilenemedi.');
-  return { accessToken: data.access_token, refreshToken: data.refresh_token || refreshToken };
-}
-
-// Send tweet (supports OAuth 1.0a, OAuth 2.0 Bearer with auto-refresh)
-app.post('/api/twitter/send', async (req, res) => {
-  const { consumerKey, consumerSecret, accessToken, accessTokenSecret, refreshToken, text } = req.body;
-  if (!text) return res.status(400).json({ success: false, error: 'text gerekli.' });
-  if (!accessToken) return res.status(400).json({ success: false, error: 'accessToken gerekli.' });
-
-  const url = 'https://api.twitter.com/2/tweets';
-  const isOAuth1 = !!(consumerKey && consumerSecret && accessTokenSecret);
-
-  const post = async (token) => {
-    const authHeader = isOAuth1
-      ? buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret)
-      : `Bearer ${token}`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: authHeader },
-      body: JSON.stringify({ text }),
-    });
-    return { status: r.status, data: await r.json().catch(() => ({})) };
-  };
-
-  try {
-    let { status, data } = await post(accessToken);
-    let refreshedTokens = null;
-
-    if (status === 401 && !isOAuth1 && refreshToken) {
-      try {
-        refreshedTokens = await refreshTwitterOAuth2Token(refreshToken);
-        ({ status, data } = await post(refreshedTokens.accessToken));
-      } catch (refreshErr) {
-        return res.status(401).json({
-          success: false,
-          error: 'Twitter oturumunun süresi doldu ve otomatik yenileme başarısız oldu: ' + refreshErr.message + ' — Hesaplar sekmesinden Twitter\'ı OAuth ile yeniden bağla.',
-        });
-      }
-    }
-
-    if (status >= 200 && status < 300 && data.data?.id) {
-      return res.json({ success: true, tweetId: data.data.id, ...(refreshedTokens ? { refreshedTokens } : {}) });
-    }
-    return res.status(400).json({ success: false, error: JSON.stringify(data.errors || data.detail || data) });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ OAuth 2.0 PKCE 1-Click Login (Universal for unlimited accounts)
-// ═══════════════════════════════════════════════════════════════════════════
-app.get('/api/twitter/oauth/start', (req, res) => {
-  const clientId     = process.env.TWITTER_CLIENT_ID || 'UXdLRTNQNmxTVW1Fc1pwWVVmVmI6MTpjaQ';
-  const clientSecret = process.env.TWITTER_CLIENT_SECRET;
-
-  const state        = crypto.randomBytes(16).toString('hex');
-  const codeVerifier = crypto.randomBytes(32).toString('base64url');
-  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-  const redirectUri  = `${req.protocol}://${req.get('host')}/api/twitter/callback`;
-
-  twitterOAuthSessions.set(state, { codeVerifier, clientId, clientSecret, redirectUri });
-
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: 'tweet.read tweet.write users.read offline.access',
-    state,
-    code_challenge: codeChallenge,
-    code_challenge_method: 'S256',
-  });
-
-  return res.redirect(`https://twitter.com/i/oauth2/authorize?${params}`);
-});
-
-app.get('/api/twitter/callback', async (req, res) => {
-  const { code, state, error } = req.query;
-
-  if (error) {
-    return res.send(`<html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;">
-      <div style="font-size:48px">❌</div>
-      <h2 style="margin:0">Twitter Yetkilendirme Hatası</h2>
-      <p style="color:#94a3b8;margin:0">${error}</p>
-      <script>window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'${error}' }, '*');</script>
-    </body></html>`);
-  }
-
-  const session = twitterOAuthSessions.get(state);
-  if (!session) {
-    return res.send(`<html><body><script>
-      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:'Session süresi doldu.' }, '*');
-      window.close();
-    </script></body></html>`);
-  }
-  twitterOAuthSessions.delete(state);
-
-  try {
-    const { codeVerifier, clientId, clientSecret, redirectUri } = session;
-
-    const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
-    if (clientSecret) {
-      headers['Authorization'] = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
-    }
-
-    const tokenRes = await fetch('https://api.twitter.com/2/oauth2/token', {
-      method: 'POST',
-      headers,
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: redirectUri,
-        code_verifier: codeVerifier,
-        client_id: clientId,
-      }),
-    });
-
-    const tokenData = await tokenRes.json();
-    if (!tokenRes.ok) throw new Error(tokenData.error_description || JSON.stringify(tokenData));
-
-    // Get user info
-    const userRes = await fetch('https://api.twitter.com/2/users/me?user.fields=name,username', {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` }
-    });
-    const userData = await userRes.json();
-    const twitterUser = userData.data || {};
-
-    const payload = JSON.stringify({
-      accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token || '',
-      username: twitterUser.username || 'Twitter',
-      name: twitterUser.name || 'Twitter Hesabı',
-    });
-
-    return res.send(`<html><body><script>
-      window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_SUCCESS', payload: ${JSON.stringify(payload)} }, '*');
-      window.close();
-    </script><p style="font-family:sans-serif;text-align:center;padding:40px;color:green;">✅ Twitter hesabı başarıyla bağlandı! Bu pencere kapanıyor...</p></body></html>`);
-  } catch (err) {
-    return res.send(`<html><body style="background:#0f172a;color:#f8fafc;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;">
-      <div style="font-size:48px">❌</div>
-      <h2 style="margin:0">Twitter Bağlantı Hatası</h2>
-      <p style="color:#f43f5e">${err.message}</p>
-      <script>window.opener && window.opener.postMessage({ type:'TWITTER_AUTH_ERROR', error:${JSON.stringify(err.message)} }, '*');</script>
-    </body></html>`);
-  }
-});
-
-
-
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ Real headless-browser posting (Puppeteer + stealth)
-//  Hand-crafted HTTP requests to Twitter's internal API get flagged a lot
-//  more than an actual browser session does — this drives a real (stealth)
-//  Chromium instance with the session cookies instead, same technique tools
-//  like XActions use. Falls back to the lightweight HTTP client (below) if
-//  Chromium can't launch in this environment, instead of hard-failing.
-// ═══════════════════════════════════════════════════════════════════════════
-let sharedBrowser = null;
-async function getBrowser() {
-  if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
-  sharedBrowser = await puppeteerExtra.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-  });
-  sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
-  return sharedBrowser;
-}
-
-async function withXPage(authToken, ct0, fn) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  try {
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-    await page.setCookie(
-      { name: 'auth_token', value: authToken, domain: '.x.com', path: '/', httpOnly: true, secure: true },
-      { name: 'ct0', value: ct0, domain: '.x.com', path: '/', secure: true },
-    );
-    return await fn(page);
-  } finally {
-    await page.close().catch(() => {});
-  }
-}
-
-// Confirms a session is genuinely logged in by loading the real timeline —
-// far more reliable than any single API endpoint, since it's exactly what
-// a human opening x.com would see.
-async function verifyXSessionViaBrowser(authToken, ct0) {
-  return withXPage(authToken, ct0, async (page) => {
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    if (/\/(login|i\/flow\/login)(\?|$)/.test(page.url())) return { loggedIn: false };
-
-    // The account-switcher button in the sidebar only renders for a logged
-    // in session — bad/expired cookies render the logged-out landing page
-    // at the *same* URL (no redirect to /login), so its presence is the
-    // real signal, not just "did we get bounced to a login route".
-    try {
-      await page.waitForSelector('[data-testid="SideNav_AccountSwitcher_Button"]', { timeout: 15000 });
-    } catch (_) {
-      return { loggedIn: false };
-    }
-    const username = await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
-      const match = (btn?.innerText || '').match(/@(\w+)/);
-      return match ? match[1] : null;
-    });
-
-    return { loggedIn: true, username };
-  });
-}
-
-// Posts a tweet by driving the real compose UI instead of calling an API.
-async function postTweetViaBrowser(authToken, ct0, text) {
-  return withXPage(authToken, ct0, async (page) => {
-    await page.goto('https://x.com/compose/post', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    if (/\/(login|i\/flow\/login)(\?|$)/.test(page.url())) {
-      throw new Error('Oturum geçersiz — Twitter giriş sayfasına yönlendirdi.');
-    }
-
-    const editorSelector = '[data-testid="tweetTextarea_0"]';
-    await page.waitForSelector(editorSelector, { timeout: 20000 });
-    await page.click(editorSelector);
-    await page.keyboard.type(text, { delay: 12 });
-
-    const postButtonSelector = '[data-testid="tweetButton"]';
-    await page.waitForSelector(postButtonSelector, { timeout: 10000 });
-    await page.click(postButtonSelector);
-
-    const outcome = await Promise.race([
-      page.waitForSelector(editorSelector, { hidden: true, timeout: 20000 }).then(() => ({ ok: true })),
-      page.waitForSelector('[data-testid="toast"]', { timeout: 20000 }).then(async (el) => ({
-        ok: false, message: (await page.evaluate(e => e.innerText, el)) || 'Tweet gönderilemedi.',
-      })),
-    ]).catch(() => ({ ok: true })); // Ambiguous timeout — don't falsely report failure if it likely went through.
-
-    if (!outcome.ok) throw new Error(outcome.message);
-    return { success: true };
-  });
-}
-
-function extractAuthCookiePair(cookieStrings) {
-  const find = (name) => {
-    const line = (cookieStrings || []).find(c => c.trim().startsWith(name + '='));
-    return line ? line.split(';')[0].split('=').slice(1).join('=').trim() : null;
-  };
-  return { authToken: find('auth_token'), ct0: find('ct0') };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TWITTER ─ Free "no developer account" login (username + password → cookies)
-//  Uses Twitter's own web session (like logging in from a browser) instead of
-//  the paid Twitter Developer API. No client id / API key needed at all.
-// ═══════════════════════════════════════════════════════════════════════════
-app.post('/api/twitter/free-login', async (req, res) => {
-  const { username, password, email, twoFactorSecret } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ success: false, error: 'Kullanıcı adı ve şifre gerekli.' });
-  }
-  try {
-    const scraper = new Scraper();
-    await scraper.login(username.trim(), password, email?.trim() || undefined, twoFactorSecret?.trim() || undefined);
-
-    const cookies = (await scraper.getCookies()).map(c => c.toString());
-    if (!cookies.some(c => /^auth_token=/.test(c))) {
-      throw new Error('Giriş başarısız. Kullanıcı adı/şifreyi kontrol et.');
-    }
-
-    // Real authenticated check (this hits verify_credentials.json using the
-    // now-established user session, not the guest-token login flow — it
-    // actually confirms Twitter accepts these cookies for authenticated
-    // requests, instead of just trusting that login() didn't throw).
-    const loggedIn = await scraper.isLoggedIn();
-    if (!loggedIn) {
-      throw new Error('Oturum doğrulanamadı. Twitter bu çerezleri reddetti — "Çerezle Bağlan" sekmesini kullanmayı dene.');
-    }
-    const profile = await scraper.me();
-
-    return res.json({
-      success: true,
-      user: {
-        username: profile?.username || username.trim(),
-        name: profile?.name || profile?.username || username.trim(),
-      },
-      cookies,
-    });
-  } catch (err) {
-    console.error('[Twitter free-login] failed:', err.message);
-    let msg = err.message || 'Giriş başarısız.';
-    if (/acid|arkose|challenge|LoginAcid|Denied login/i.test(msg)) {
-      msg = 'X (Twitter) bu girişi şüpheli buldu ve ek doğrulama istiyor. Bu genellikle sunucu IP\'sinden otomatik giriş denemelerinde olur. Aşağıdaki "Çerezle Bağlan" sekmesini kullan — %100 çalışır ve şifreni hiç sunucuya göndermez.';
-    } else if (/page does not exist|does not exist/i.test(msg)) {
-      msg = 'X şu an bu otomatik giriş yöntemini engelliyor (sunucu IP\'si şüpheli görünüyor olabilir). Aşağıdaki "Çerezle Bağlan" sekmesini kullan — kesin çözüm.';
-    }
-    return res.status(400).json({ success: false, error: msg });
-  }
-});
-
-// ── Cookie-paste login: the most reliable free method. The user logs into
-// x.com in their own browser (so it looks like a normal human session, not
-// a datacenter IP hitting Twitter's login flow) and pastes the auth_token +
-// ct0 cookies here. No password ever touches our server.
-app.post('/api/twitter/free-login-cookies', async (req, res) => {
-  const { authToken, ct0, username } = req.body;
-  if (!authToken || !ct0) {
-    return res.status(400).json({ success: false, error: 'auth_token ve ct0 çerez değerleri gerekli.' });
-  }
-  const cleanUsername = username?.trim().replace(/^@/, '') || '';
-  const authTokenVal = authToken.trim();
-  const ct0Val = ct0.trim();
-
-  try {
-    // Try the real-browser check first (matches what X's own detection
-    // expects); fall back to the lightweight HTTP client if Chromium can't
-    // run in this environment, instead of hard-failing the whole feature.
-    let loggedIn, resolvedUsername = cleanUsername, cookies;
-    try {
-      const result = await verifyXSessionViaBrowser(authTokenVal, ct0Val);
-      loggedIn = result.loggedIn;
-      resolvedUsername = result.username || cleanUsername;
-      cookies = [`auth_token=${authTokenVal}; Domain=twitter.com; Path=/`, `ct0=${ct0Val}; Domain=twitter.com; Path=/`];
-    } catch (browserErr) {
-      console.error('[Twitter free-login-cookies] browser check failed, falling back to HTTP:', browserErr.message);
-      const scraper = new Scraper();
-      await scraper.setCookies([
-        `auth_token=${authTokenVal}; Domain=twitter.com; Path=/`,
-        `ct0=${ct0Val}; Domain=twitter.com; Path=/`,
-      ]);
-      loggedIn = await scraper.isLoggedIn();
-      if (loggedIn) {
-        const profile = await scraper.me();
-        resolvedUsername = profile?.username || cleanUsername;
-      }
-      cookies = (await scraper.getCookies()).map(c => c.toString());
-    }
-
-    if (!loggedIn) {
-      throw new Error('Twitter bu çerezleri kabul etmedi. auth_token/ct0 süresi dolmuş olabilir — x.com\'da çıkış yapmadan (!) tekrar DevTools\'tan taze değerleri kopyala.');
-    }
-
-    return res.json({
-      success: true,
-      user: { username: resolvedUsername || 'twitter', name: resolvedUsername || 'Twitter Hesabı' },
-      cookies,
-    });
-  } catch (err) {
-    console.error('[Twitter free-login-cookies] failed:', err.message);
-    return res.status(400).json({ success: false, error: err.message.includes('çerez') || err.message.includes('kabul') ? err.message : 'Çerezler geçersiz görünüyor: ' + err.message });
-  }
-});
-
-// Send a tweet using stored session cookies (no API keys involved). Tries
-// the real-browser path first, falls back to the raw HTTP client on failure.
-app.post('/api/twitter/free-send', async (req, res) => {
-  const { cookies, text } = req.body;
-  if (!cookies?.length || !text) return res.status(400).json({ success: false, error: 'cookies ve text gerekli.' });
-
-  const { authToken, ct0 } = extractAuthCookiePair(cookies);
-  if (authToken && ct0) {
-    try {
-      await postTweetViaBrowser(authToken, ct0, text);
-      return res.json({ success: true });
-    } catch (browserErr) {
-      console.error('[Twitter free-send] browser post failed, falling back to HTTP:', browserErr.message);
-    }
-  }
-
-  try {
-    const scraper = new Scraper();
-    await scraper.setCookies(cookies);
-    const result = await scraper.sendTweet(text);
-    let data = {};
-    try { data = await result.json(); } catch (_) {}
-    const tweetId = data?.data?.create_tweet?.tweet_results?.result?.rest_id;
-    const errMsg = data?.errors?.[0]?.message;
-    if (errMsg) return res.status(400).json({ success: false, error: errMsg });
-    return res.json({ success: true, tweetId: tweetId || null });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  WHATSAPP ─ Send
-// ═══════════════════════════════════════════════════════════════════════════
-app.post('/api/whatsapp/send', async (req, res) => {
-  const { accessToken, phoneNumberId, recipientPhone, text, mediaUrl } = req.body;
-  if (!accessToken || !phoneNumberId || !recipientPhone || !text)
-    return res.status(400).json({ success: false, error: 'Tüm alanlar gerekli.' });
-  const cleanPhone = recipientPhone.replace(/\D/g, '');
-  try {
-    const body = mediaUrl
-      ? { messaging_product: 'whatsapp', to: cleanPhone, type: 'image', image: { link: mediaUrl, caption: text } }
-      : { messaging_product: 'whatsapp', to: cleanPhone, type: 'text', text: { body: text } };
-    const r = await fetch(`https://graph.facebook.com/v19.0/${phoneNumberId}/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
-      body: JSON.stringify(body),
-    });
-    const data = await r.json();
-    if (r.ok && data.messages) return res.json({ success: true, messageId: data.messages[0]?.id });
-    return res.status(400).json({ success: false, error: JSON.stringify(data.error || data) });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  DISCORD ─ Test + Send
-// ═══════════════════════════════════════════════════════════════════════════
-app.post('/api/discord/test-webhook', async (req, res) => {
-  const { webhookUrl } = req.body;
-  if (!webhookUrl?.startsWith('https://discord.com/api/webhooks/'))
-    return res.status(400).json({ success: false, error: 'Geçersiz Webhook URL' });
-  try {
-    const r = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: '🤖 OmniSync: Webhook bağlantısı doğrulandı!' }) });
-    if (r.ok || r.status === 204) return res.json({ success: true });
-    return res.status(400).json({ success: false, error: 'Discord yanıt vermedi.' });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/discord/send', async (req, res) => {
-  const { webhookUrl, username, text, mediaUrl } = req.body;
-  if (!webhookUrl || !text) return res.status(400).json({ success: false, error: 'webhookUrl ve text gerekli.' });
-  try {
-    const payload = { username: username || 'OmniSync Social', content: text };
-    if (mediaUrl) payload.embeds = [{ image: { url: mediaUrl } }];
-    const r = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    if (r.ok || r.status === 204) return res.json({ success: true });
-    return res.status(400).json({ success: false, error: await r.text() });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  BROADCAST DISPATCH
-// ═══════════════════════════════════════════════════════════════════════════
-app.post('/api/dispatch', async (req, res) => {
-  const { accounts, text, mediaUrl } = req.body;
-  if (!accounts?.length || !text) return res.status(400).json({ success: false, error: 'accounts ve text gerekli.' });
-
-  const base = `${req.protocol}://${req.get('host')}`;
-  const results = [];
-
-  for (const acc of accounts) {
-    try {
-      const c = acc.credentials || {};
-      let r, result;
-
-      if (acc.platform === 'telegram') {
-        r = await fetch(`${base}/api/telegram/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken: c.botToken, chatId: c.chatId, text, mediaUrl }) });
-        result = await r.json();
-      } else if (acc.platform === 'twitter') {
-        if (c.cookies?.length) {
-          // Free cookie-session login (no developer API)
-          r = await fetch(`${base}/api/twitter/free-send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cookies: c.cookies, text }) });
-        } else {
-          // OAuth 1.0a: use consumerKey + accessToken, or OAuth2 bearer accessToken
-          r = await fetch(`${base}/api/twitter/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, refreshToken: c.refreshToken, text }) });
-        }
-        result = await r.json();
-        // OAuth2 tokens auto-rotate on refresh — hand the new ones back so
-        // the caller (frontend account state) doesn't keep using dead ones.
-        if (result.refreshedTokens) result.updatedCredentials = result.refreshedTokens;
-      } else if (acc.platform === 'whatsapp') {
-        r = await fetch(`${base}/api/whatsapp/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessToken: c.accessToken, phoneNumberId: c.phoneNumberId, recipientPhone: c.recipientPhone, text, mediaUrl }) });
-        result = await r.json();
-      } else if (acc.platform === 'discord') {
-        r = await fetch(`${base}/api/discord/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhookUrl: c.webhookUrl, username: c.username, text, mediaUrl }) });
-        result = await r.json();
-      } else {
-        result = { success: false, error: 'Desteklenmeyen platform: ' + acc.platform };
-      }
-
-      results.push({ accountId: acc.id, accountName: acc.name, platform: acc.platform, ...result });
-    } catch (err) {
-      results.push({ accountId: acc.id, accountName: acc.name, platform: acc.platform, success: false, error: err.message });
-    }
-  }
-
-  return res.json({ success: true, results });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM SESSION STORE (frontend pushes session after QR login)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Store a Telegram user session on the server so we can listen to messages.
-// The frontend re-posts this on a heartbeat to self-heal after restarts, so
-// we must NOT clobber an already-connected client — that would silently
-// spin up a second listener alongside the first and double-post everything.
 app.post('/api/telegram/session/store', (req, res) => {
   const { accountId, accountName, sessionString, apiId, apiHash } = req.body;
   if (!accountId || !sessionString) return res.status(400).json({ success: false, error: 'accountId ve sessionString gerekli.' });
   const existing = tgActiveSessions.get(accountId);
-  tgActiveSessions.set(accountId, { accountId, accountName, sessionString, apiId, apiHash, client: existing?.client || null });
+  tgActiveSessions.set(accountId, {
+    accountId, accountName, sessionString,
+    apiId: apiId || '2040',
+    apiHash: apiHash || 'b18441a1ed607e10e4b39251a1319a14',
+    client: existing?.client || null
+  });
   saveState();
   return res.json({ success: true, message: 'Oturum sunucuya kaydedildi.' });
 });
@@ -851,17 +256,97 @@ app.get('/api/telegram/session/list', (_req, res) => {
   res.json({ success: true, sessions: list });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  SYNC RULES ENGINE
-// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/telegram/session/start-listener', async (req, res) => {
+  const { accountId } = req.body;
+  if (!accountId) return res.status(400).json({ success: false, error: 'accountId gerekli.' });
+  try {
+    await startTelegramListener(accountId);
+    return res.json({ success: true, message: 'Telegram dinleyicisi başlatıldı.' });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  TWITTER API (Verification & Tweeting via Official OAuth 1.0a)
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/twitter/verify', async (req, res) => {
+  const { consumerKey, consumerSecret, accessToken, accessTokenSecret } = req.body;
+  if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret) {
+    return res.status(400).json({ success: false, error: 'Lütfen tüm 4 Twitter API anahtarını doldurun.' });
+  }
+
+  try {
+    // Try v1.1 verify_credentials
+    const url1 = 'https://api.twitter.com/1.1/account/verify_credentials.json';
+    const auth1 = buildOAuth1Header('GET', url1, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    const r1 = await fetch(url1, { headers: { Authorization: auth1 } });
+    const data1 = await r1.json();
+
+    if (r1.ok && (data1.screen_name || data1.name)) {
+      return res.json({
+        success: true,
+        user: { username: data1.screen_name, name: data1.name || data1.screen_name }
+      });
+    }
+
+    // Fallback: try v2 users/me
+    const url2 = 'https://api.twitter.com/2/users/me';
+    const auth2 = buildOAuth1Header('GET', url2, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    const r2 = await fetch(url2, { headers: { Authorization: auth2 } });
+    const data2 = await r2.json();
+
+    if (r2.ok && data2.data?.id) {
+      return res.json({
+        success: true,
+        user: { username: data2.data.username, name: data2.data.name || data2.data.username }
+      });
+    }
+
+    const errDetail = (data1.errors && data1.errors[0]?.message) || data2.detail || data2.title || JSON.stringify(data1 || data2);
+    return res.status(400).json({ success: false, error: errDetail });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Twitter doğrulama hatası: ' + err.message });
+  }
+});
+
+app.post('/api/twitter/send', async (req, res) => {
+  const { consumerKey, consumerSecret, accessToken, accessTokenSecret, text } = req.body;
+  if (!text) return res.status(400).json({ success: false, error: 'Tweet metni boş olamaz.' });
+  if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret) {
+    return res.status(400).json({ success: false, error: 'Twitter API anahtarları eksik.' });
+  }
+
+  try {
+    const url = 'https://api.twitter.com/2/tweets';
+    const authHeader = buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+      body: JSON.stringify({ text }),
+    });
+
+    const data = await r.json();
+    if (r.ok && data.data?.id) {
+      return res.json({ success: true, tweetId: data.data.id });
+    }
+    return res.status(400).json({ success: false, error: JSON.stringify(data.errors || data.detail || data) });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SYNC RULES & TEST PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/sync/rules', (_req, res) => {
   res.json({ success: true, rules: [...syncRulesStore.values()] });
 });
 
 app.post('/api/sync/rules', (req, res) => {
   const rule = req.body;
-  if (!rule?.id) return res.status(400).json({ success: false, error: 'rule.id gerekli.' });
+  if (!rule?.id) return res.status(400).json({ success: false, error: 'Kural ID eksik.' });
   syncRulesStore.set(rule.id, { ...rule, enabled: rule.enabled !== false });
   saveState();
   return res.json({ success: true });
@@ -873,84 +358,61 @@ app.delete('/api/sync/rules/:id', (req, res) => {
   return res.json({ success: true });
 });
 
-// Audit trail so the frontend can show WHY an auto-sync attempt succeeded,
-// was filtered, or failed — otherwise those results only ever hit the
-// server console and the user has no way to see them.
 app.get('/api/sync/logs', (_req, res) => {
   res.json({ success: true, logs: syncLog });
 });
 
-// ─── Execute sync: called when a Telegram message arrives ──────────────────
-async function executeSyncRule(rule, message, twitterAccounts) {
-  if (!rule.enabled) return;
+// Manual rule execution test (sends a test tweet immediately)
+app.post('/api/sync/test', async (req, res) => {
+  const { ruleId, text } = req.body;
+  const rule = syncRulesStore.get(ruleId);
+  if (!rule) return res.status(404).json({ success: false, error: 'Kural bulunamadı.' });
 
-  const rawText = message.text || message.caption || '';
-  const text = buildTweetText(rawText, rule);
-  if (!text) {
-    pushSyncLog({
-      source: `Telegram → ${rule.title}`,
-      messagePreview: (rawText || '(boş mesaj)').slice(0, 80),
-      targets: (twitterAccounts || []).map(a => a.name),
-      status: 'filtered',
-      details: rawText.trim() ? 'Yasaklı kelime filtresine takıldı veya metin boş kaldı.' : 'Mesajda metin yok (sadece medya/diğer).',
-    });
-    return;
-  }
+  const twitterAccounts = rule.targetAccounts || [];
+  if (!twitterAccounts.length) return res.status(400).json({ success: false, error: 'Kuralda hedef Twitter hesabı seçilmemiş.' });
 
-  if (!twitterAccounts?.length) {
-    pushSyncLog({
-      source: `Telegram → ${rule.title}`,
-      messagePreview: text.slice(0, 80),
-      targets: [],
-      status: 'error',
-      details: 'Kuralda hedef hesap seçili değil.',
-    });
-    return;
-  }
+  const testText = text || `⚡ OmniSync Test Tweeti [${new Date().toLocaleTimeString('tr-TR')}]`;
+  const formattedText = buildTweetText(testText, rule);
+
+  if (!formattedText) return res.status(400).json({ success: false, error: 'Yasaklı kelime filtresi mesajı engelledi.' });
 
   const results = [];
   for (const twAcc of twitterAccounts) {
+    const c = twAcc.credentials || {};
     try {
-      const c = twAcc.credentials || {};
-      const endpoint = c.cookies?.length ? 'free-send' : 'send';
-      const body = c.cookies?.length
-        ? { cookies: c.cookies, text }
-        : { consumerKey: c.consumerKey, consumerSecret: c.consumerSecret, accessToken: c.accessToken, accessTokenSecret: c.accessTokenSecret, refreshToken: c.refreshToken, text };
-      const r = await fetch(`http://localhost:${PORT}/api/twitter/${endpoint}`, {
+      const url = 'https://api.twitter.com/2/tweets';
+      const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
+      const r = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+        body: JSON.stringify({ text: formattedText }),
       });
       const d = await r.json();
-      console.log(`[Sync] Rule "${rule.title}" → Twitter @${twAcc.username}: ${d.success ? '✅' : '❌ ' + d.error}`);
-      results.push({ account: twAcc.name, success: !!d.success, error: d.error });
-
-      // Persist rotated OAuth2 tokens back into the stored rule so the next
-      // auto-sync (and the next server restart, via disk) uses the live one
-      // instead of the one that just expired.
-      if (d.refreshedTokens) {
-        twAcc.credentials.accessToken = d.refreshedTokens.accessToken;
-        twAcc.credentials.refreshToken = d.refreshedTokens.refreshToken;
-        saveState();
+      if (r.ok && d.data?.id) {
+        results.push({ account: twAcc.name, success: true, tweetId: d.data.id });
+      } else {
+        results.push({ account: twAcc.name, success: false, error: JSON.stringify(d.errors || d.detail || d) });
       }
     } catch (e) {
-      console.error('[Sync] Twitter post error:', e.message);
       results.push({ account: twAcc.name, success: false, error: e.message });
     }
   }
 
   const failCount = results.filter(r => !r.success).length;
   pushSyncLog({
-    source: `Telegram → ${rule.title}`,
-    messagePreview: text.slice(0, 80),
+    source: `Test → ${rule.title}`,
+    messagePreview: formattedText.slice(0, 80),
     targets: twitterAccounts.map(a => a.name),
-    status: failCount === 0 ? 'success' : (failCount === results.length ? 'error' : 'partial'),
-    details: results.map(r => `${r.account}: ${r.success ? '✅ gönderildi' : '❌ ' + (r.error || 'bilinmeyen hata')}`).join(' · '),
+    status: failCount === 0 ? 'success' : 'error',
+    details: results.map(r => `${r.account}: ${r.success ? '✅ Gönderildi' : '❌ ' + r.error}`).join(' · '),
   });
-}
 
+  return res.json({ success: failCount === 0, results, error: failCount > 0 ? results.map(r => r.error).join(', ') : null });
+});
+
+// ─── Format Tweet Text ──────────────────────────────────────────────────────
 function buildTweetText(rawText, rule) {
-  let text = rawText.trim();
+  let text = (rawText || '').trim();
   if (!text) return '';
 
   // Banned keywords filter
@@ -959,7 +421,7 @@ function buildTweetText(rawText, rule) {
     if (banned.some(k => text.toLowerCase().includes(k))) return '';
   }
 
-  // Max 280 chars for tweets
+  // Slice to max 270 chars
   if (text.length > 270) text = text.slice(0, 267) + '...';
 
   // Auto hashtags
@@ -971,25 +433,25 @@ function buildTweetText(rawText, rule) {
   return text;
 }
 
-// ─── Start Telegram listener for an account ────────────────────────────────
+// ─── Telegram Listener Engine ───────────────────────────────────────────────
 async function startTelegramListener(accountId) {
   const sess = tgActiveSessions.get(accountId);
-  if (!sess || sess.client) return; // already running
+  if (!sess || sess.client) return; // already active
 
   try {
     const { TelegramClient } = await import('teleproto');
     const { StringSession } = await import('teleproto/sessions/index.js');
-    const { NewMessage } = await import('teleproto/events/index.js');
 
     const client = new TelegramClient(
       new StringSession(sess.sessionString),
-      parseInt(sess.apiId || process.env.TELEGRAM_API_ID, 10),
-      sess.apiHash || process.env.TELEGRAM_API_HASH,
-      { connectionRetries: 5, useWSS: true }
+      parseInt(sess.apiId || '2040', 10),
+      sess.apiHash || 'b18441a1ed607e10e4b39251a1319a14',
+      { connectionRetries: 10, useWSS: true }
     );
+
     await client.connect();
     sess.client = client;
-    console.log(`[Telegram] Listener started for account ${accountId}`);
+    console.log(`[Telegram] Dinleyici başlatıldı: ${accountId} (${sess.accountName})`);
 
     client.addEventHandler(async (event) => {
       const msg = event.message;
@@ -998,34 +460,29 @@ async function startTelegramListener(accountId) {
       const msgKey = `${accountId}:${msg.id}`;
       if (recentlySynced.has(msgKey)) return;
       recentlySynced.add(msgKey);
-      setTimeout(() => recentlySynced.delete(msgKey), 60000); // cleanup after 1 min
+      setTimeout(() => recentlySynced.delete(msgKey), 60000);
 
-      // gramjs exposes the internal channelId/chatId (no sign, no -100
-      // prefix), but the UI tells users to paste Telegram's *display* id
-      // (e.g. -1001234567890). Normalize both sides the same way so they
-      // actually compare equal.
       const chatId = msg.peerId?.channelId?.toString() ||
                      msg.peerId?.chatId?.toString() ||
                      msg.peerId?.userId?.toString() || '';
       const senderId = msg.fromId?.userId?.toString() || '';
 
-      console.log(`[Telegram] New message from chatId=${chatId} senderId=${senderId}: ${(msg.text || '').slice(0, 80)}`);
+      const rawText = msg.text || msg.caption || '';
+      console.log(`[Telegram] Yeni mesaj geldi (Chat: ${chatId}): ${rawText.slice(0, 60)}`);
 
       const accountRules = [...syncRulesStore.values()].filter(
         r => r.enabled && r.sourceAccountId === accountId
       );
 
-      // Only resolve the chat's @username if some rule actually filters by it
       let chatUsername = null;
       if (accountRules.some(r => r.sourceChannelId?.trim().startsWith('@'))) {
         try {
           const chat = await msg.getChat();
           chatUsername = (chat?.username || '').toLowerCase();
-        } catch (_) { /* ignore, falls through as no match for @-filters */ }
+        } catch (_) {}
       }
 
       const matchingRules = accountRules.filter(rule => {
-        // Channel filter
         const rawFilter = rule.sourceChannelId?.trim();
         if (rawFilter) {
           if (rawFilter.startsWith('@')) {
@@ -1035,67 +492,98 @@ async function startTelegramListener(accountId) {
             if (ruleChannelId && chatId !== ruleChannelId) return false;
           }
         }
-
-        // Sender filter
-        if (rule.allowedSenders?.trim()) {
-          const allowed = rule.allowedSenders.split(',').map(s => s.trim()).filter(Boolean);
-          if (!allowed.includes(senderId) && !allowed.includes(msg.sender?.username)) return false;
-        }
-
         return true;
       });
-
-      if (accountRules.length && !matchingRules.length) {
-        console.log(`[Telegram] Message did not match any rule for account ${accountId} (chatId=${chatId}, chatUsername=${chatUsername || '-'})`);
-      }
 
       for (const rule of matchingRules) {
         await executeSyncRule(rule, msg, rule.targetAccounts || []);
       }
-    }, new NewMessage({}));
+    });
 
-  } catch (e) {
-    console.error(`[Telegram] Listener error for ${accountId}:`, e.message);
+  } catch (err) {
+    console.error(`[Telegram] Dinleyici başlatma hatası (${accountId}):`, err.message);
+    sess.client = null;
   }
 }
 
-app.post('/api/telegram/session/start-listener', async (req, res) => {
-  const { accountId } = req.body;
-  if (!tgActiveSessions.has(accountId)) return res.status(404).json({ success: false, error: 'Oturum bulunamadı.' });
-  startTelegramListener(accountId);
-  return res.json({ success: true, message: 'Dinleyici başlatıldı.' });
-});
+async function executeSyncRule(rule, message, twitterAccounts) {
+  if (!rule.enabled) return;
 
-// ─── Manual trigger endpoint (for testing) ────────────────────────────────
-app.post('/api/sync/test', async (req, res) => {
-  const { ruleId, text } = req.body;
-  const rule = syncRulesStore.get(ruleId);
-  if (!rule) return res.status(404).json({ success: false, error: 'Kural bulunamadı.' });
-  await executeSyncRule(rule, { text }, rule.targetAccounts || []);
-  res.json({ success: true });
-});
+  const rawText = message.text || message.caption || '';
+  const text = buildTweetText(rawText, rule);
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Static frontend
-// ═══════════════════════════════════════════════════════════════════════════
-const distPath = path.join(__dirname, 'dist');
-app.use(express.static(distPath));
-app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
-
-// ─── Restore persisted state on boot: revive sync rules + reconnect any
-// Telegram sessions we knew about before this restart, without waiting on
-// the frontend heartbeat or the user reconnecting anything by hand.
-function restoreState() {
-  const { sessions, rules } = loadState();
-  for (const rule of rules) syncRulesStore.set(rule.id, rule);
-  for (const s of sessions) {
-    tgActiveSessions.set(s.accountId, { ...s, client: null });
-    startTelegramListener(s.accountId).catch(e => console.error(`[Persist] Restore listener failed for ${s.accountId}:`, e.message));
+  if (!text) {
+    pushSyncLog({
+      source: `Telegram → ${rule.title}`,
+      messagePreview: (rawText || '(boş mesaj)').slice(0, 80),
+      targets: (twitterAccounts || []).map(a => a.name),
+      status: 'filtered',
+      details: rawText.trim() ? 'Yasaklı kelime filtresine takıldı.' : 'Mesajda metin yok.',
+    });
+    return;
   }
-  if (sessions.length || rules.length) {
-    console.log(`[Persist] Restored ${sessions.length} Telegram session(s) and ${rules.length} sync rule(s) from disk.`);
+
+  if (!twitterAccounts?.length) {
+    pushSyncLog({
+      source: `Telegram → ${rule.title}`,
+      messagePreview: text.slice(0, 80),
+      targets: [],
+      status: 'error',
+      details: 'Hedef Twitter hesabı seçilmemiş.',
+    });
+    return;
   }
+
+  const results = [];
+  for (const twAcc of twitterAccounts) {
+    const c = twAcc.credentials || {};
+    try {
+      const url = 'https://api.twitter.com/2/tweets';
+      const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+        body: JSON.stringify({ text }),
+      });
+      const d = await r.json();
+      const ok = r.ok && d.data?.id;
+      results.push({ account: twAcc.name, success: !!ok, error: d.errors ? d.errors[0]?.message : (d.detail || d.title) });
+    } catch (e) {
+      results.push({ account: twAcc.name, success: false, error: e.message });
+    }
+  }
+
+  const failCount = results.filter(r => !r.success).length;
+  pushSyncLog({
+    source: `Telegram → ${rule.title}`,
+    messagePreview: text.slice(0, 80),
+    targets: twitterAccounts.map(a => a.name),
+    status: failCount === 0 ? 'success' : (failCount === results.length ? 'error' : 'partial'),
+    details: results.map(r => `${r.account}: ${r.success ? '✅ Gönderildi' : '❌ ' + (r.error || 'Hata')}`).join(' · '),
+  });
 }
-restoreState();
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 OmniSync Social v3.2 port ${PORT}`));
+// Serve static build from dist folder
+app.use(express.static(path.join(__dirname, 'dist')));
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+// Restore saved sessions and listener loops on server boot
+const saved = loadState();
+for (const s of saved.sessions) {
+  tgActiveSessions.set(s.accountId, { ...s, client: null });
+}
+for (const r of saved.rules) {
+  syncRulesStore.set(r.id, r);
+}
+
+app.listen(PORT, () => {
+  console.log(`🚀 Telegram-Twitter AutoSync server running on port ${PORT}`);
+  // Auto-start listeners after 3s
+  setTimeout(() => {
+    for (const id of tgActiveSessions.keys()) {
+      startTelegramListener(id).catch(console.error);
+    }
+  }, 3000);
+});

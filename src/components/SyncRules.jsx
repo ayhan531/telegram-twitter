@@ -1,178 +1,130 @@
 import React, { useState, useEffect } from 'react';
 import {
   Repeat, Plus, Trash2, CheckCircle2, ArrowRight,
-  SlidersHorizontal, X, ChevronDown, ChevronUp,
-  Play, Pause, Send, Loader2, Info, ExternalLink
+  SlidersHorizontal, X, Play, Pause, Send, Loader2, Info
 } from 'lucide-react';
 
-const PLATFORM_EMOJI = { twitter: '𝕏', telegram: '✈️', whatsapp: '💬', discord: '🎮', linkedin: 'in' };
-const PLATFORM_LABEL = { twitter: 'Twitter', telegram: 'Telegram', whatsapp: 'WhatsApp', discord: 'Discord', linkedin: 'LinkedIn' };
-
-// ════════════════════════════════════════════════════════════════════════════
-// RULE FORM
-// ════════════════════════════════════════════════════════════════════════════
 function RuleForm({ accounts, initial, onSave, onCancel }) {
   const telegramAccounts = accounts.filter(a => a.platform === 'telegram');
-  const targetAccounts   = accounts.filter(a => a.platform !== 'telegram');
+  const twitterAccounts  = accounts.filter(a => a.platform === 'twitter');
 
   const [form, setForm] = useState(initial || {
-    title: 'Yeni Oto-Sync Kuralı',
+    title: 'Oto-Tweet Kuralı',
     sourceAccountId: telegramAccounts[0]?.credentials?.accountId || telegramAccounts[0]?.id || '',
-    sourceChannelId: '',   // Telegram kanal ID veya @username
-    allowedSenders: '',    // Boş = herkes, ID ile filtrele
-    targetIds: targetAccounts.map(a => a.id),
+    sourceChannelId: '', // @kanaladi, -100... or empty for all
+    targetIds: twitterAccounts.map(a => a.id),
     autoHashtags: '',
     bannedKeywords: '',
-    forwardMedia: false,
     enabled: true,
   });
 
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
-  const toggleTarget = (id) => set('targetIds', form.targetIds.includes(id)
-    ? form.targetIds.filter(x => x !== id)
-    : [...form.targetIds, id]);
 
   const handleSave = () => {
-    if (!form.sourceAccountId) { alert('Kaynak Telegram hesabı seçin.'); return; }
-    if (form.targetIds.length === 0) { alert('En az 1 hedef hesap seçin.'); return; }
-    if (!form.sourceChannelId.trim()) { alert('Kanal ID veya kullanıcı adı girin.'); return; }
+    if (!form.sourceAccountId && telegramAccounts.length > 0) {
+      form.sourceAccountId = telegramAccounts[0]?.credentials?.accountId || telegramAccounts[0]?.id;
+    }
+    if (!form.sourceAccountId) {
+      alert('Lütfen önce Telegram hesabınızı bağlayın.');
+      return;
+    }
+    if (twitterAccounts.length === 0) {
+      alert('Lütfen hedef olarak Twitter hesabı bağlayın.');
+      return;
+    }
 
-    // Attach full account objects for server-side use
-    const targetAccObjs = accounts.filter(a => form.targetIds.includes(a.id));
+    const selectedTwitter = twitterAccounts.filter(a => form.targetIds.includes(a.id));
     onSave({
       ...form,
       id: initial?.id || `rule-${Date.now()}`,
-      targetAccounts: targetAccObjs,
+      targetAccounts: selectedTwitter.length > 0 ? selectedTwitter : twitterAccounts,
     });
   };
 
   return (
     <div className="space-y-4">
-      {/* Rule title */}
       <div>
         <label className="text-[11px] font-bold text-slate-300 block mb-1">Kural Adı</label>
         <input type="text" value={form.title} onChange={e => set('title', e.target.value)}
+          placeholder="Örn: Kripto Haber Oto-Tweet"
           className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
       </div>
 
-      {/* Source Telegram account */}
       <div>
         <label className="text-[11px] font-bold text-slate-300 block mb-1">📥 Kaynak: Telegram Hesabı</label>
         {telegramAccounts.length === 0 ? (
-          <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/20 text-xs text-amber-300">
-            Önce Telegram hesabı bağlamalısın (Hesaplar sekmesi).
+          <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
+            Önce Telegram hesabı bağlamalısın (Bağlantılar sekmesi).
           </div>
         ) : (
           <select value={form.sourceAccountId} onChange={e => set('sourceAccountId', e.target.value)}
-            className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs bg-slate-800">
+            className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs bg-slate-800 border border-slate-700">
             {telegramAccounts.map(a => (
               <option key={a.id} value={a.credentials?.accountId || a.id}>
-                ✈️ {a.name} {a.username}
+                ✈️ {a.name} ({a.username})
               </option>
             ))}
           </select>
         )}
       </div>
 
-      {/* Source channel/group */}
       <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">📡 Kaynak: Kanal veya Grup</label>
-        <p className="text-[10px] text-slate-500 mb-1.5">
-          Kanal/grup @kullanıcıadı gir (örn: <code className="text-sky-400">@btchaber</code>) veya ID numarası (örn: <code className="text-sky-400">-1001234567890</code>).
-          Boş bırakırsan tüm mesajlar yakalanır.
+        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">📡 Kaynak: Kanal, Grup veya Sohbet</label>
+        <p className="text-[10px] text-slate-400 mb-1.5">
+          Kanal/Grup kullanıcı adı (örn: <code className="text-sky-400">@btchaber</code>) veya ID numarası (örn: <code className="text-sky-400">-1001234567890</code>).
+          <strong> Boş bırakırsan gelen TÜM mesajlar tweet atılır.</strong>
         </p>
         <input type="text" value={form.sourceChannelId} onChange={e => set('sourceChannelId', e.target.value)}
-          placeholder="@kanaladi veya -1001234567890 (boş = hepsi)"
+          placeholder="@kanaladi veya -1001234567890 (Boş = Tüm mesajlar)"
           className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
-        <a href="https://t.me/username_to_id_bot" target="_blank" rel="noopener noreferrer"
-          className="inline-flex items-center space-x-1 text-[10px] text-sky-400 hover:underline mt-1">
-          <ExternalLink size={10} /><span>Kanal ID'sini nasıl öğrenirim? →</span>
-        </a>
       </div>
 
-      {/* Sender filter */}
       <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">👤 Gönderen Filtresi (isteğe bağlı)</label>
-        <p className="text-[10px] text-slate-500 mb-1.5">Sadece belirli kullanıcıların mesajlarını al. Boş = herkesinki. Virgülle ayır.</p>
-        <input type="text" value={form.allowedSenders} onChange={e => set('allowedSenders', e.target.value)}
-          placeholder="123456789, 987654321 veya boş bırak"
-          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
-      </div>
-
-      {/* Target accounts */}
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1.5">📤 Hedef Hesaplar</label>
-        {targetAccounts.length === 0 ? (
-          <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/20 text-xs text-amber-300">
-            Hedef olarak Twitter, WhatsApp veya Discord hesabı bağlamalısın.
+        <label className="text-[11px] font-bold text-slate-300 block mb-1">📤 Hedef Twitter Hesabı</label>
+        {twitterAccounts.length === 0 ? (
+          <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
+            Önce Twitter hesabı bağlamalısın (Bağlantılar sekmesi).
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {targetAccounts.map(a => {
-              const selected = form.targetIds.includes(a.id);
-              return (
-                <button key={a.id} type="button" onClick={() => toggleTarget(a.id)}
-                  className={`flex items-center space-x-2 p-2.5 rounded-xl border text-left transition ${
-                    selected
-                      ? 'bg-indigo-600/20 border-indigo-500/60 text-white'
-                      : 'bg-slate-800/40 border-slate-700 text-slate-400 hover:border-slate-600'
-                  }`}>
-                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center text-sm font-bold ${selected ? 'bg-indigo-600' : 'bg-slate-700'}`}>
-                    {PLATFORM_EMOJI[a.platform]}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold truncate">{a.name}</p>
-                    <p className="text-[10px] opacity-60">{PLATFORM_LABEL[a.platform]}</p>
-                  </div>
-                  {selected && <CheckCircle2 size={14} className="text-indigo-400 shrink-0" />}
-                </button>
-              );
-            })}
+          <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <span className="text-sm">𝕏</span>
+              <span className="text-xs font-bold text-white">{twitterAccounts[0].name} ({twitterAccounts[0].username})</span>
+            </div>
+            <CheckCircle2 size={16} className="text-emerald-400" />
           </div>
         )}
       </div>
 
-      {/* Auto hashtags */}
       <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">🏷️ Otomatik Hashtag (isteğe bağlı)</label>
+        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">🏷️ Otomatik Hashtag (İsteğe Bağlı)</label>
         <input type="text" value={form.autoHashtags} onChange={e => set('autoHashtags', e.target.value)}
-          placeholder="#kripto, #bitcoin, #telegram"
+          placeholder="#kripto, #gündem, #telegram"
           className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
       </div>
 
-      {/* Banned keywords */}
       <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">🚫 Yasaklı Kelimeler (isteğe bağlı)</label>
-        <p className="text-[10px] text-slate-500 mb-1">Bu kelimeleri içeren mesajlar tweet atılmaz. Virgülle ayır.</p>
+        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">🚫 Yasaklı Kelimeler (İsteğe Bağlı)</label>
+        <p className="text-[10px] text-slate-400 mb-1">Bu kelimeleri içeren mesajlar tweet atılmaz. Virgülle ayırın.</p>
         <input type="text" value={form.bannedKeywords} onChange={e => set('bannedKeywords', e.target.value)}
           placeholder="reklam, spam, promosyon"
           className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
       </div>
 
       <div className="flex space-x-3 pt-2">
-        <button onClick={onCancel}
-          className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-semibold transition border border-slate-700">
-          İptal
-        </button>
-        <button onClick={handleSave}
-          className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold transition shadow-md">
-          Kuralı Kaydet ✓
-        </button>
+        <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700">İptal</button>
+        <button onClick={handleSave} className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-md">Kuralı Kaydet ✓</button>
       </div>
     </div>
   );
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// MAIN COMPONENT
-// ════════════════════════════════════════════════════════════════════════════
 export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
   const [showForm, setShowForm] = useState(false);
   const [editingRule, setEditingRule] = useState(null);
   const [testingId, setTestingId] = useState(null);
   const [testText, setTestText] = useState('');
 
-  // On mount: load rules from server (in case server was restarted)
   useEffect(() => {
     fetch('/api/sync/rules')
       .then(r => r.json())
@@ -181,14 +133,13 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
   }, []);
 
   const handleSave = async (rule) => {
-    // Save to server
     try {
       await fetch('/api/sync/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(rule),
       });
-    } catch (e) { console.error(e); }
+    } catch (e) {}
 
     setRules(prev => {
       const idx = prev.findIndex(r => r.id === rule.id);
@@ -197,7 +148,7 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
     });
     setShowForm(false);
     setEditingRule(null);
-    onShowToast('Kural kaydedildi!', 'success');
+    onShowToast('Oto-Sync kuralı kaydedildi!', 'success');
   };
 
   const handleDelete = async (id) => {
@@ -217,7 +168,7 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
   };
 
   const handleTest = async (rule) => {
-    const text = testText || 'OmniSync test mesajı: Bu Telegram kanalından gelen bir deneme tweeti. ✅';
+    const text = testText || '⚡ OmniSync Test Tweeti: Telegram -> Twitter Oto-Sync bağlantısı aktif ve çalışıyor! ✅';
     setTestingId(rule.id);
     try {
       const r = await fetch('/api/sync/test', {
@@ -226,67 +177,47 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
         body: JSON.stringify({ ruleId: rule.id, text }),
       });
       const d = await r.json();
-      onShowToast(d.success ? '✅ Test tweeti atıldı!' : '❌ Hata: ' + d.error, d.success ? 'success' : 'error');
+      onShowToast(d.success ? '✅ Test tweeti başarıyla atıldı!' : '❌ Hata: ' + d.error, d.success ? 'success' : 'error');
     } catch (e) {
-      onShowToast('❌ ' + e.message, 'error');
+      onShowToast('❌ Hata: ' + e.message, 'error');
     } finally {
       setTestingId(null);
     }
   };
 
   const telegramAccounts = accounts.filter(a => a.platform === 'telegram');
-  const targetAccounts   = accounts.filter(a => a.platform !== 'telegram');
+  const twitterAccounts  = accounts.filter(a => a.platform === 'twitter');
 
   return (
     <div className="space-y-6">
 
       {/* Header */}
-      <div className="p-5 rounded-2xl glass-panel border border-slate-800 flex items-center justify-between gap-4">
+      <div className="p-6 rounded-2xl glass-panel border border-slate-800 flex items-center justify-between gap-4">
         <div>
-          <h2 className="text-lg font-bold text-white flex items-center space-x-2">
-            <Repeat className="text-indigo-400" size={20} /><span>Oto-Sync Kuralları</span>
+          <h2 className="text-xl font-bold text-white flex items-center space-x-2">
+            <Repeat className="text-indigo-400" size={22} />
+            <span>Oto-Tweet Kuralları</span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Telegram kanalından gelen mesajları otomatik olarak Twitter, WhatsApp vb. platformlara ilet.
+            Telegram kanallarından ve sohbetlerinden gelen mesajların otomatik tweet atılması için kurallarını yönet.
           </p>
         </div>
         <button onClick={() => { setEditingRule(null); setShowForm(true); }}
           className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-md transition flex items-center space-x-2">
-          <Plus size={16} /><span>Kural Ekle</span>
+          <Plus size={16} /><span>Yeni Kural Ekle</span>
         </button>
       </div>
 
       {/* Prerequisites warning */}
-      {(telegramAccounts.length === 0 || targetAccounts.length === 0) && (
+      {(telegramAccounts.length === 0 || twitterAccounts.length === 0) && (
         <div className="p-4 rounded-2xl bg-amber-950/30 border border-amber-500/20 text-xs text-amber-200 space-y-2">
           <p className="font-bold text-amber-300 flex items-center space-x-2">
-            <Info size={14} /><span>Kural eklemeden önce:</span>
+            <Info size={14} /><span>Kural oluşturmadan önce:</span>
           </p>
-          {telegramAccounts.length === 0 && <p>• <strong>Telegram hesabı</strong> bağla (Hesaplar sekmesi → QR kodu tara)</p>}
-          {targetAccounts.length === 0 && <p>• <strong>Hedef hesap</strong> bağla (Twitter, WhatsApp veya Discord)</p>}
+          {telegramAccounts.length === 0 && <p>• <strong>Telegram Hesabı</strong> bağla (Bağlantılar sekmesi)</p>}
+          {twitterAccounts.length === 0 && <p>• <strong>Twitter Hesabı</strong> bağla (Bağlantılar sekmesi)</p>}
         </div>
       )}
-
-      {/* How it works */}
-      <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 text-xs text-slate-400 space-y-2">
-        <p className="font-bold text-white text-sm">⚡ Nasıl Çalışır?</p>
-        <div className="flex items-start space-x-2">
-          <span className="text-sky-400 font-mono shrink-0">1.</span>
-          <span>Telegram hesabını QR ile bağla → sistem arka planda o hesabın mesajlarını dinlemeye başlar</span>
-        </div>
-        <div className="flex items-start space-x-2">
-          <span className="text-sky-400 font-mono shrink-0">2.</span>
-          <span>Buraya kural ekle: Kaynak kanal + Hedef Twitter/WhatsApp hesabı seç</span>
-        </div>
-        <div className="flex items-start space-x-2">
-          <span className="text-sky-400 font-mono shrink-0">3.</span>
-          <span>O kanalda yeni mesaj geldiğinde sistem otomatik tweet/mesaj atar — sen hiçbir şey yapmadan</span>
-        </div>
-        <div className="mt-2 p-2.5 rounded-lg bg-amber-950/30 border border-amber-500/20 text-amber-300 space-y-1">
-          <p>⚠️ Render'ın ücretsiz planı 15 dk trafik gelmezse sunucuyu uyutuyor. Bu sayfa açıkken sistem her dakika kendini otomatik onarıyor (Telegram dinleyicisini ve kuralları yeniden kuruyor), o yüzden sekmeyi açık tutmak yeterli.</p>
-          <p>Tarayıcı kapalıyken de kesintisiz çalışsın istiyorsan, <a href="https://cron-job.org" target="_blank" rel="noopener noreferrer" className="underline">cron-job.org</a> gibi ücretsiz bir servisle bu adrese 10 dakikada bir istek attır — Render hiç uyumaz.</p>
-        </div>
-      </div>
 
       {/* Form Modal */}
       {showForm && (
@@ -294,14 +225,13 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
           <div className="w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl my-8">
             <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
               <h3 className="font-bold text-white text-base">
-                {editingRule ? 'Kuralı Düzenle' : 'Yeni Kural Ekle'}
+                {editingRule ? 'Kuralı Düzenle' : 'Yeni Oto-Tweet Kuralı Ekle'}
               </h3>
-              <button onClick={() => { setShowForm(false); setEditingRule(null); }}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800">
+              <button onClick={() => { setShowForm(false); setEditingRule(null); }} className="text-slate-400 hover:text-white">
                 <X size={18} />
               </button>
             </div>
-            <div className="p-6 max-h-[80vh] overflow-y-auto">
+            <div className="p-6">
               <RuleForm
                 accounts={accounts}
                 initial={editingRule}
@@ -319,106 +249,89 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
           <div className="text-5xl">⚡</div>
           <h3 className="text-sm font-bold text-slate-200">Henüz Kural Yok</h3>
           <p className="text-xs text-slate-400 max-w-sm mx-auto leading-relaxed">
-            "Kural Ekle" ile Telegram kanalını Twitter/WhatsApp hesabına bağla.
-            Kanal mesajları otomatik olarak paylaşılacak.
+            "Yeni Kural Ekle" butonuna basarak Telegram kanalını Twitter hesabına bağla.
           </p>
-          <button onClick={() => setShowForm(true)}
-            className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-md">
+          <button onClick={() => setShowForm(true)} className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-md">
             + İlk Kuralı Ekle
           </button>
         </div>
       ) : (
         <div className="space-y-4">
-          {/* Test text input */}
-          <div className="flex items-center space-x-3 p-3 rounded-xl bg-slate-900 border border-slate-800">
+          {/* Test Text Input */}
+          <div className="flex items-center space-x-3 p-3.5 rounded-xl bg-slate-900 border border-slate-800">
             <input type="text" value={testText} onChange={e => setTestText(e.target.value)}
-              placeholder="Test tweeti metni (boş bırakırsan varsayılan kullanılır)"
+              placeholder="Test tweeti metni (Boş bırakırsanız varsayılan test mesajı yollanır)"
               className="flex-1 px-3 py-2 rounded-xl glass-input text-white text-xs" />
           </div>
 
-          {rules.map(rule => {
-            const srcAcc = accounts.find(a =>
-              (a.credentials?.accountId || a.id) === rule.sourceAccountId
-            );
-            const targets = (rule.targetAccounts || []).filter(t =>
-              accounts.find(a => a.id === t.id)
-            );
+          {rules.map(rule => (
+            <div key={rule.id} className={`p-5 rounded-2xl glass-panel border transition ${rule.enabled ? 'border-indigo-500/30 bg-indigo-950/10' : 'border-slate-800 opacity-60'}`}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center space-x-2 mb-3">
+                    <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${rule.enabled ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
+                    <h3 className="font-bold text-sm text-white truncate">{rule.title}</h3>
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${rule.enabled ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-500/30' : 'bg-slate-800 text-slate-400'}`}>
+                      {rule.enabled ? 'AKTİF' : 'PASİF'}
+                    </span>
+                  </div>
 
-            return (
-              <div key={rule.id} className={`p-5 rounded-2xl glass-panel border transition ${rule.enabled ? 'border-indigo-500/30 bg-indigo-950/10' : 'border-slate-800 opacity-60'}`}>
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center space-x-2 mb-3">
-                      <span className={`w-2 h-2 rounded-full shrink-0 ${rule.enabled ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
-                      <h3 className="font-bold text-sm text-white truncate">{rule.title}</h3>
-                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${rule.enabled ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-500/30' : 'bg-slate-800 text-slate-400'}`}>
-                        {rule.enabled ? 'AKTİF' : 'DURAKLATILDI'}
-                      </span>
-                    </div>
-
-                    {/* Flow visualization */}
-                    <div className="flex items-center space-x-2 flex-wrap gap-y-2">
-                      <div className="flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg bg-sky-900/30 border border-sky-500/20">
-                        <span className="text-sm">✈️</span>
-                        <div>
-                          <p className="text-[10px] font-semibold text-sky-300">{srcAcc?.name || 'Telegram'}</p>
-                          <p className="text-[9px] text-slate-400 font-mono">{rule.sourceChannelId || 'Tüm kanallar'}</p>
-                        </div>
-                      </div>
-                      <ArrowRight size={14} className="text-slate-500 shrink-0" />
-                      <div className="flex items-center space-x-1.5 flex-wrap gap-1">
-                        {(rule.targetAccounts || []).map(t => (
-                          <div key={t.id} className="flex items-center space-x-1 px-2 py-1 rounded-lg bg-indigo-900/30 border border-indigo-500/20">
-                            <span className="text-xs">{PLATFORM_EMOJI[t.platform]}</span>
-                            <span className="text-[10px] text-indigo-300 font-semibold">{t.name}</span>
-                          </div>
-                        ))}
+                  {/* Flow Visualization */}
+                  <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+                    <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-sky-900/30 border border-sky-500/20">
+                      <span className="text-sm">✈️</span>
+                      <div>
+                        <p className="text-[11px] font-semibold text-sky-300">Telegram</p>
+                        <p className="text-[9px] text-slate-400 font-mono">{rule.sourceChannelId || 'Tüm Mesajlar'}</p>
                       </div>
                     </div>
 
-                    {/* Tags / filters */}
-                    <div className="flex items-center flex-wrap gap-1.5 mt-2">
-                      {rule.allowedSenders && (
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                          👤 Filtreli gönderen
-                        </span>
-                      )}
-                      {rule.autoHashtags && (
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                          🏷️ {rule.autoHashtags.split(',')[0].trim()}...
-                        </span>
-                      )}
-                      {rule.bannedKeywords && (
-                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-950/40 text-rose-300 border border-rose-500/20">
-                          🚫 Filtre aktif
-                        </span>
-                      )}
+                    <ArrowRight size={14} className="text-slate-500 shrink-0" />
+
+                    <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-indigo-900/30 border border-indigo-500/20">
+                      <span className="text-sm">𝕏</span>
+                      <span className="text-[11px] text-indigo-300 font-semibold">Twitter</span>
                     </div>
                   </div>
 
-                  {/* Actions */}
-                  <div className="flex flex-col space-y-1.5 shrink-0">
-                    <button onClick={() => handleToggle(rule)} title={rule.enabled ? 'Duraklat' : 'Başlat'}
-                      className={`p-1.5 rounded-lg border transition ${rule.enabled ? 'bg-amber-500/10 border-amber-500/30 text-amber-400 hover:bg-amber-500/20' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'}`}>
-                      {rule.enabled ? <Pause size={14} /> : <Play size={14} />}
-                    </button>
-                    <button onClick={() => handleTest(rule)} disabled={testingId === rule.id} title="Test tweeti at"
-                      className="p-1.5 rounded-lg border bg-indigo-500/10 border-indigo-500/30 text-indigo-400 hover:bg-indigo-500/20 transition">
-                      {testingId === rule.id ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                    </button>
-                    <button onClick={() => { setEditingRule(rule); setShowForm(true); }} title="Düzenle"
-                      className="p-1.5 rounded-lg border bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700 transition">
-                      <SlidersHorizontal size={14} />
-                    </button>
-                    <button onClick={() => handleDelete(rule.id)} title="Sil"
-                      className="p-1.5 rounded-lg border bg-rose-500/10 border-rose-500/20 text-rose-400 hover:bg-rose-500/20 transition">
-                      <Trash2 size={14} />
-                    </button>
+                  {/* Filters */}
+                  <div className="flex items-center flex-wrap gap-2 mt-3">
+                    {rule.autoHashtags && (
+                      <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                        🏷️ {rule.autoHashtags}
+                      </span>
+                    )}
+                    {rule.bannedKeywords && (
+                      <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-rose-950/40 text-rose-300 border border-rose-500/20">
+                        🚫 Filtre: {rule.bannedKeywords}
+                      </span>
+                    )}
                   </div>
                 </div>
+
+                {/* Actions */}
+                <div className="flex items-center space-x-2 shrink-0">
+                  <button onClick={() => handleToggle(rule)} title={rule.enabled ? 'Duraklat' : 'Başlat'}
+                    className={`p-2 rounded-xl border transition ${rule.enabled ? 'bg-amber-500/10 border-amber-500/30 text-amber-400 hover:bg-amber-500/20' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20'}`}>
+                    {rule.enabled ? <Pause size={14} /> : <Play size={14} />}
+                  </button>
+                  <button onClick={() => handleTest(rule)} disabled={testingId === rule.id} title="Test Tweeti At"
+                    className="px-3 py-2 rounded-xl border bg-indigo-600/20 border-indigo-500/40 text-indigo-300 hover:bg-indigo-600/30 text-xs font-bold flex items-center space-x-1 transition">
+                    {testingId === rule.id ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+                    <span>Test Tweeti At</span>
+                  </button>
+                  <button onClick={() => { setEditingRule(rule); setShowForm(true); }} title="Düzenle"
+                    className="p-2 rounded-xl border bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700 transition">
+                    <SlidersHorizontal size={14} />
+                  </button>
+                  <button onClick={() => handleDelete(rule.id)} title="Sil"
+                    className="p-2 rounded-xl border bg-rose-500/10 border-rose-500/20 text-rose-400 hover:bg-rose-500/20 transition">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               </div>
-            );
-          })}
+            </div>
+          ))}
         </div>
       )}
     </div>
