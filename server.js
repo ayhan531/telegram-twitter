@@ -335,7 +335,11 @@ app.post('/api/twitter/free-login', async (req, res) => {
       cookies: cookieStrings,
     });
   } catch (err) {
-    return res.status(400).json({ success: false, error: 'Giriş hatası: ' + err.message });
+    let msg = err.message || '';
+    if (msg.includes('34') || msg.includes('does not exist') || msg.includes('page does not exist')) {
+      msg = 'Twitter güvenlik duvarı sunucudan şifreli girişi engelledi (Hata 34). Lütfen üstteki "auth_token" sekmesini seçip x.com\'dan alacağınız auth_token ile şifresiz ve sınırsız bağlanın.';
+    }
+    return res.status(400).json({ success: false, error: msg });
   }
 });
 

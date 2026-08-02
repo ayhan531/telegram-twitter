@@ -651,7 +651,17 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
               <button onClick={handleVerifyTwitter} disabled={twStatus === 'loading'}
                 className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center space-x-2 transition shadow-md">
                 {twStatus === 'loading' ? <Loader2 size={15} className="animate-spin text-white" /> : <ShieldCheck size={16} />}
-                <span>{twStatus === 'loading' ? 'Doğrulanıyor...' : (twTab === 'auth_token' ? '⚡ Sınırsız Modda Bağla' : '🔌 API Keys Bağla')}</span>
+                <span>
+                  {twStatus === 'loading'
+                    ? 'Doğrulanıyor...'
+                    : twTab === 'auto_login'
+                    ? '🚀 Otomatik Giriş Yap & Bağla'
+                    : twTab === 'auth_token'
+                    ? '⚡ Token ile Bağla'
+                    : twTab === 'cookie_json'
+                    ? '🍪 JSON ile Bağla'
+                    : '🔌 API Keys ile Bağla'}
+                </span>
               </button>
             </div>
           </div>
