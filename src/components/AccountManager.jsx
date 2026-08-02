@@ -499,9 +499,20 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
               <div className="space-y-3">
                 <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-xs text-emerald-200 space-y-1.5 leading-relaxed">
                   <p className="font-bold text-emerald-300 flex items-center space-x-1 text-sm">
-                    <span>🚀 1-Tıkla Otomatik Giriş (Sıfır Kopyalama!)</span>
+                    <span>🚀 1-Tıkla Otomatik Giriş</span>
                   </p>
-                  <p>Kopyala-yapıştır yapmana gerek yok! Twitter kullanıcı adını ve şifreni gir, arkadaki betik otomatik giriş yapıp tüm çerez ve token'ları kendisi çekip bağlasın!</p>
+                  <p>Twitter kullanıcı adını ve şifreni gir, arkadaki betik otomatik giriş yapıp hesabı bağlasın.</p>
+                </div>
+
+                {/* Notice for Google/Apple SSO users */}
+                <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200 space-y-1">
+                  <p className="font-bold text-amber-300 flex items-center space-x-1">
+                    <span>🌐 Google veya Apple ile Giriş Yaptıysanız:</span>
+                  </p>
+                  <p>Google ile üye olduysan varsayılan şifren olmayabilir. Bu durumda üstten <strong>auth_token</strong> sekmesine geçerek 10 saniyede şifresiz bağlanabilirsin!</p>
+                  <button type="button" onClick={() => setTwTab('auth_token')} className="mt-1 text-sky-400 font-bold underline block">
+                    ➜ Şifresiz Bağlan (auth_token Sekmesine Geç)
+                  </button>
                 </div>
 
                 <div>
