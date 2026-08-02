@@ -318,20 +318,47 @@ app.post('/api/twitter/send', async (req, res) => {
   }
 
   try {
-    const url = 'https://api.twitter.com/2/tweets';
-    const authHeader = buildOAuth1Header('POST', url, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+    // 1. Try Twitter API v2 (/2/tweets)
+    const url2 = 'https://api.twitter.com/2/tweets';
+    const authHeader2 = buildOAuth1Header('POST', url2, consumerKey, consumerSecret, accessToken, accessTokenSecret);
 
-    const r = await fetch(url, {
+    const r2 = await fetch(url2, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader2 },
       body: JSON.stringify({ text }),
     });
 
-    const data = await r.json();
-    if (r.ok && data.data?.id) {
-      return res.json({ success: true, tweetId: data.data.id });
+    const data2 = await r2.json();
+    if (r2.ok && data2.data?.id) {
+      return res.json({ success: true, tweetId: data2.data.id });
     }
-    return res.status(400).json({ success: false, error: JSON.stringify(data.errors || data.detail || data) });
+
+    const rawError = (data2.errors && data2.errors[0]?.message) || data2.detail || data2.title || JSON.stringify(data2);
+
+    // If credits depleted or 403/429 error, try v1.1 endpoint fallback
+    try {
+      const url1 = `https://api.twitter.com/1.1/statuses/update.json?status=${rfc3986Encode(text)}`;
+      const authHeader1 = buildOAuth1Header('POST', url1, consumerKey, consumerSecret, accessToken, accessTokenSecret);
+      const r1 = await fetch('https://api.twitter.com/1.1/statuses/update.json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: authHeader1 },
+        body: `status=${rfc3986Encode(text)}`,
+      });
+      const data1 = await r1.json();
+      if (r1.ok && (data1.id_str || data1.id)) {
+        return res.json({ success: true, tweetId: data1.id_str || data1.id });
+      }
+    } catch (_) {}
+
+    // Translate credits depleted error to actionable user explanation
+    if (rawError.toLowerCase().includes('credits depleted') || rawError.toLowerCase().includes('limit')) {
+      return res.status(400).json({
+        success: false,
+        error: 'Twitter Developer Hesabınızın Aylık Ücretsiz Tweet Kotası Doldu! (developer.twitter.com adresinden yeni bir Uygulama/Keys oluşturun veya hesabı yenileyin).'
+      });
+    }
+
+    return res.status(400).json({ success: false, error: rawError });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
