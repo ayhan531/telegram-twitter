@@ -381,37 +381,38 @@ app.post('/api/twitter/cookie-verify', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Lütfen auth_token veya çerez bilgilerinizi girin.' });
   }
 
-  cookieArray = normalizeTwitterCookies(cookieArray);
-  if (!cookieArray.some(c => c.startsWith('auth_token='))) {
-    return res.status(400).json({ success: false, error: 'Çerezler içinde auth_token bulunamadı. Lütfen x.com çerezlerinden auth_token değerini girin.' });
+  // ct0'ı burada çözüp kaydediyoruz ki her tweet'te yeniden alınmasın.
+  const prepared = await prepareTwitterCookies(cookieArray);
+  if (prepared.error) {
+    return res.status(400).json({ success: false, error: prepared.error });
   }
+  cookieArray = prepared.cookieStrings;
 
   try {
     const scraper = new Scraper();
     await scraper.setCookies(cookieArray);
-    
-    // Check login status or fetch me
-    let username = 'Twitter Kullanıcısı';
+    try { await scraper.auth.updateGuestToken(); } catch (_) {}
+
+    let username = null;
     try {
       const me = await scraper.getMe();
       if (me?.username) username = me.username;
-    } catch (_) {}
+    } catch (e) {
+      console.warn('[Twitter] getMe hatası:', e.message);
+    }
 
     const isLoggedIn = await scraper.isLoggedIn().catch(() => false);
 
-    // If username resolved or isLoggedIn is true, account is valid!
-    if (isLoggedIn || username !== 'Twitter Kullanıcısı') {
-      return res.json({
-        success: true,
-        user: { username, name: username },
-        cookies: cookieArray,
+    if (!username && !isLoggedIn) {
+      return res.status(400).json({
+        success: false,
+        error: 'Çerezler Twitter tarafından kabul edilmedi. auth_token süresi dolmuş olabilir — x.com\'da oturumu açıp auth_token ve ct0 değerlerini yeniden kopyalayın.',
       });
     }
 
-    // Try without strict isLoggedIn check if cookies set
     return res.json({
       success: true,
-      user: { username: 'Twitter Hesabı', name: 'Twitter Hesabı' },
+      user: { username: username || 'Twitter Hesabı', name: username || 'Twitter Hesabı' },
       cookies: cookieArray,
     });
 
@@ -420,12 +421,12 @@ app.post('/api/twitter/cookie-verify', async (req, res) => {
   }
 });
 
-// agent-twitter-client çerezleri "https://twitter.com" host-only olarak kaydediyor,
-// ancak tweet/medya istekleri api.twitter.com ve upload.twitter.com'a gidiyor.
-// Domain=.twitter.com eklenmezse çerezler o isteklere hiç eklenmez ve tweet atılamaz.
-// Ayrıca ct0 yoksa x-csrf-token başlığı boş kalır (403). ct0 istemci üretimli bir
-// değerdir; sunucu sadece cookie == header eşleşmesine bakar, o yüzden yoksa üretiriz.
-function normalizeTwitterCookies(input) {
+// agent-twitter-client'ın kullandığı web bearer token'ının aynısı.
+const TWITTER_BEARER = 'AAAAAAAAAAAAAAAAAAAAAFQODgEAAAAAVHTp76lzh3rFzcHbmHVvQxYYpTw%3DckAlMINMjmCwxUcaXbAN4XqJVdgMJaHqNOFgPMK0zN1qLqLQCF';
+
+// Çerez listesini {key: value} haritasına çevirir. Hem "a=b" düz metin, hem
+// Cookie-Editor'ün {name, value} / tough-cookie'nin {key, value} biçimlerini kabul eder.
+function parseCookieMap(input) {
   const arr = Array.isArray(input) ? input : [input];
   const jar = new Map();
   for (const raw of arr) {
@@ -440,18 +441,80 @@ function normalizeTwitterCookies(input) {
     if (eq < 1) continue;
     const key = first.slice(0, eq).trim();
     const value = first.slice(eq + 1).trim();
-    if (key && value) jar.set(key, value);
+    if (key && value && value !== 'undefined' && value !== 'null') jar.set(key, value);
   }
-  if (jar.has('auth_token') && !jar.has('ct0')) {
-    jar.set('ct0', crypto.randomBytes(16).toString('hex'));
-  }
+  return jar;
+}
+
+// agent-twitter-client çerezleri "https://twitter.com" host-only kaydediyor, ama
+// istekler api.twitter.com / upload.twitter.com'a gidiyor. Domain=.twitter.com
+// eklenmezse çerezler o alt alan adlarına hiç gönderilmez.
+function toCookieStrings(jar) {
   return [...jar.entries()].map(([k, v]) => `${k}=${v}; Domain=.twitter.com; Path=/; Secure; SameSite=None`);
+}
+
+// ct0 (CSRF) uydurulamaz — Twitter onu sunucu tarafında oturuma bağlar ve
+// eşleşmeyen değer "Could not authenticate you (32)" hatası verir. Kullanıcı ct0
+// girmediyse auth_token ile Twitter'dan gerçek bir tane aldırırız.
+async function fetchCt0(authToken) {
+  const attempts = [
+    { url: 'https://api.twitter.com/1.1/account/settings.json', headers: { authorization: `Bearer ${TWITTER_BEARER}` } },
+    { url: 'https://x.com/', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' } },
+  ];
+  for (const { url, headers } of attempts) {
+    try {
+      const r = await fetch(url, { headers: { ...headers, cookie: `auth_token=${authToken}` }, redirect: 'manual' });
+      const setCookies = typeof r.headers.getSetCookie === 'function'
+        ? r.headers.getSetCookie()
+        : [r.headers.get('set-cookie') || ''];
+      for (const sc of setCookies) {
+        const m = /(?:^|[;,\s])ct0=([^;,\s]+)/.exec(sc || '');
+        if (m && m[1] && m[1].length > 8) {
+          console.log(`[Twitter] ct0 otomatik alındı (${url})`);
+          return m[1];
+        }
+      }
+    } catch (e) {
+      console.warn(`[Twitter] ct0 alınamadı (${url}):`, e.message);
+    }
+  }
+  return null;
+}
+
+// auth_token + gerçek ct0 içeren, tweet atmaya hazır çerez listesi üretir.
+async function prepareTwitterCookies(cookies) {
+  const jar = parseCookieMap(cookies);
+  const authToken = jar.get('auth_token');
+  if (!authToken) {
+    return { error: 'Çerezlerde auth_token yok. Twitter hesabını auth_token ile yeniden bağlayın.' };
+  }
+  if (!jar.get('ct0')) {
+    const ct0 = await fetchCt0(authToken);
+    if (!ct0) {
+      return { error: 'ct0 çerezi eksik ve otomatik alınamadı. Lütfen x.com çerezlerinden ct0 değerini de kopyalayıp hesabı yeniden bağlayın.' };
+    }
+    jar.set('ct0', ct0);
+  }
+  return { cookieStrings: toCookieStrings(jar) };
 }
 
 async function postTweetViaCookies(cookies, text, mediaData = []) {
   try {
+    const prepared = await prepareTwitterCookies(cookies);
+    if (prepared.error) return { success: false, error: prepared.error };
+
     const scraper = new Scraper();
-    await scraper.setCookies(normalizeTwitterCookies(cookies));
+    await scraper.setCookies(prepared.cookieStrings);
+
+    // Kütüphane CreateTweet isteğine x-guest-token: auth.guestToken koyuyor ama
+    // setCookies sonrası bu alan hiç doldurulmuyor; "undefined" giden başlık
+    // Twitter tarafında error 32'ye yol açıyor. Burada gerçek bir token alıyoruz.
+    try {
+      await scraper.auth.updateGuestToken();
+    } catch (e) {
+      console.warn('[Twitter] guest token alınamadı:', e.message);
+    }
+
     const res = await scraper.sendTweet(text, undefined, mediaData.length ? mediaData : undefined);
 
     if (!res) {
@@ -479,8 +542,17 @@ async function postTweetViaCookies(cookies, text, mediaData = []) {
     console.log('[Twitter] Cookie tweet başarılı! Tweet ID:', tweetId || 'ok');
     return { success: true, tweetId: tweetId || null };
   } catch (err) {
-    console.error('[Twitter] Cookie tweet istisna:', err.message);
-    return { success: false, error: err.message || String(err) };
+    const raw = err.message || String(err);
+    console.error('[Twitter] Cookie tweet istisna:', raw);
+    let msg = raw;
+    if (raw.includes('"code":32') || raw.includes('Could not authenticate you')) {
+      msg = 'Twitter oturumu kabul etmedi (Hata 32). auth_token veya ct0 geçersiz/eskimiş. x.com\'da oturum açıp iki değeri de yeniden kopyalayın ve hesabı tekrar bağlayın.';
+    } else if (raw.includes('"code":353') || raw.includes('"code":403') || raw.includes('csrf')) {
+      msg = 'CSRF (ct0) doğrulaması başarısız. Lütfen x.com çerezlerinden ct0 değerini de girip hesabı yeniden bağlayın.';
+    } else if (raw.includes('"code":326') || raw.includes('locked')) {
+      msg = 'Twitter hesabı geçici olarak kilitlenmiş. x.com\'a girip doğrulamayı tamamlayın.';
+    }
+    return { success: false, error: msg };
   }
 }
 

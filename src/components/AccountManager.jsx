@@ -571,7 +571,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
 
                 <div>
                   <label className="text-[11px] font-bold text-slate-300 block mb-1">
-                    2. ct0 Değeri (auth_token'ın Hemen Altındaki Satır)
+                    2. ct0 Değeri (auth_token'ın Hemen Altındaki Satır) — Zorunlu
                   </label>
                   <input
                     type="text"
@@ -580,6 +580,10 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                     placeholder="92b3367cba18ca166ac14c1af0b7c2f2d3596fc45bc56..."
                     className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
                   />
+                  <p className="text-[10px] text-amber-300/80 mt-1.5 leading-relaxed">
+                    ct0, Twitter'ın CSRF doğrulama değeridir ve oturuma bağlıdır. Girilmezse tweet
+                    "Hata 32" ile reddedilebilir — auth_token ile aynı çerez listesinden kopyalayın.
+                  </p>
                 </div>
               </div>
             )}
