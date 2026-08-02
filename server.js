@@ -519,12 +519,74 @@ function describeTwitterError(code, status, fallback) {
   return `X hatası (HTTP ${status}${code ? ', kod ' + code : ''}): ${fallback}`;
 }
 
+// ─── Oturum Tazeleme ────────────────────────────────────────────────────────
+// X, isteklere yanıt verirken ct0'ı (CSRF) zaman zaman yeniler. Yenilenen değeri
+// yakalamazsak elimizdeki ct0 eskir ve gönderimler bir gün aniden 403 vermeye
+// başlar. Yanıtlardaki set-cookie'yi izleyip auth_token bazında saklıyor, kurallara
+// da yazıp diske kaydediyoruz — böylece yeniden başlatmalarda da korunuyor.
+const refreshedCookies = new Map(); // auth_token -> { ct0, updatedAt }
+
+function absorbSetCookies(response, cookieMap) {
+  try {
+    const list = typeof response.headers.getSetCookie === 'function'
+      ? response.headers.getSetCookie()
+      : [response.headers.get('set-cookie')].filter(Boolean);
+
+    const fresh = {};
+    for (const sc of list) {
+      const m = /^\s*(ct0|auth_token)=([^;]+)/.exec(sc || '');
+      if (m && m[2] && m[2] !== 'undefined') fresh[m[1]] = m[2];
+    }
+    if (!fresh.ct0 && !fresh.auth_token) return;
+
+    const authToken = fresh.auth_token || cookieMap.get('auth_token');
+    if (!authToken) return;
+
+    const current = cookieMap.get('ct0');
+    if (fresh.ct0 && fresh.ct0 !== current) {
+      cookieMap.set('ct0', fresh.ct0);
+      refreshedCookies.set(authToken, { ct0: fresh.ct0, updatedAt: Date.now() });
+      persistRefreshedCookie(authToken, fresh.ct0);
+      console.log('[Twitter] ct0 tazelendi ve kaydedildi.');
+    }
+  } catch (e) {
+    console.warn('[Twitter] set-cookie işlenemedi:', e.message);
+  }
+}
+
+// Tazelenen ct0'ı, o hesabı kullanan tüm kurallara yazar ve diske kaydeder.
+function persistRefreshedCookie(authToken, ct0) {
+  let changed = false;
+  for (const rule of syncRulesStore.values()) {
+    for (const acc of rule.targetAccounts || []) {
+      const cookies = acc.credentials?.cookies;
+      if (!Array.isArray(cookies)) continue;
+      if (!cookies.some(c => String(c).includes(authToken))) continue;
+
+      acc.credentials.cookies = cookies
+        .filter(c => !String(c).startsWith('ct0='))
+        .concat(`ct0=${ct0}`);
+      changed = true;
+    }
+  }
+  if (changed) saveState();
+}
+
+// Kayıtlı çerezlere, daha önce tazelenmiş ct0 varsa onu uygular.
+function applyRefreshedCookies(cookieMap) {
+  const authToken = cookieMap.get('auth_token');
+  const fresh = authToken && refreshedCookies.get(authToken);
+  if (fresh?.ct0) cookieMap.set('ct0', fresh.ct0);
+  return cookieMap;
+}
+
 // Oturumu doğrular. X, v1.1 verify_credentials'ı kapattığı için giriş yapılmış
 // ana sayfayı okuyup içindeki hesap bilgisine bakıyoruz.
 async function fetchHomePage(cookieMap) {
   const r = await fetch('https://x.com/home', {
     headers: { cookie: cookieHeaderOf(cookieMap), 'User-Agent': BROWSER_UA },
   });
+  absorbSetCookies(r, cookieMap);
   const html = await r.text();
   return { status: r.status, html };
 }
@@ -618,6 +680,7 @@ async function uploadCall(cookieMap, params, body) {
     }),
     body,
   });
+  absorbSetCookies(r, cookieMap);
   const text = await r.text();
   let data = null;
   try { data = JSON.parse(text); } catch (_) {}
@@ -690,6 +753,7 @@ async function createTweetRequest(cookieMap, op, text, mediaIds) {
     }),
   });
 
+  absorbSetCookies(r, cookieMap);
   const body = await r.text();
   let data = null;
   try { data = JSON.parse(body); } catch (_) {}
@@ -741,7 +805,7 @@ async function attemptCreateTweet(cookieMap, text, mediaIds) {
 }
 
 async function postTweetViaCookies(cookies, text, mediaData = []) {
-  const cookieMap = parseCookieMap(cookies);
+  const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
   if (!cookieMap.get('auth_token') || !cookieMap.get('ct0')) {
     return { success: false, error: 'Çerezler eksik (auth_token ve ct0 gerekli). Hesabı yeniden bağlayın.' };
   }
@@ -1163,6 +1227,70 @@ async function executeSyncRule(rule, message, twitterAccounts) {
   });
 }
 
+// ─── Oturum Sağlık Takibi ───────────────────────────────────────────────────
+// Çerezler çıkış yapılana veya şifre değiştirilene kadar geçerli kalır, ama bu
+// olduğunda uygulama bunu ancak bir mesaj kaçtığında fark ederdi. Düzenli kontrol
+// edip durumu kayıt altına alıyoruz; böylece sorun mesaj kaybetmeden görülüyor.
+const twitterHealth = new Map(); // hesap adı -> { ok, username, checkedAt, error }
+const HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+function connectedTwitterAccounts() {
+  const seen = new Map();
+  for (const rule of syncRulesStore.values()) {
+    for (const acc of rule.targetAccounts || []) {
+      const cookies = acc.credentials?.cookies;
+      if (Array.isArray(cookies) && cookies.length && !seen.has(acc.name)) {
+        seen.set(acc.name, cookies);
+      }
+    }
+  }
+  return seen;
+}
+
+async function checkTwitterSessions() {
+  const accounts = connectedTwitterAccounts();
+  if (!accounts.size) return;
+
+  for (const [name, cookies] of accounts) {
+    try {
+      const result = await verifyTwitterCookies(applyRefreshedCookies(parseCookieMap(cookies)));
+      const ok = !result.error;
+      const previous = twitterHealth.get(name);
+      twitterHealth.set(name, {
+        ok,
+        username: result.username || null,
+        checkedAt: new Date().toISOString(),
+        error: result.error || null,
+      });
+
+      if (ok) {
+        console.log(`[Sağlık] Twitter oturumu geçerli: @${result.username}`);
+      } else {
+        console.error(`[Sağlık] Twitter oturumu geçersiz (${name}): ${result.error}`);
+        // Aynı arızayı her turda tekrar tekrar loglamıyoruz.
+        if (!previous || previous.ok) {
+          pushSyncLog({
+            source: `Oturum kontrolü → ${name}`,
+            messagePreview: 'Twitter oturumu doğrulanamadı',
+            targets: [name],
+            status: 'error',
+            details: result.error + ' Yeni auth_token ve ct0 ile hesabı yeniden bağlayın.',
+          });
+        }
+      }
+    } catch (e) {
+      console.error(`[Sağlık] Kontrol hatası (${name}):`, e.message);
+    }
+  }
+}
+
+app.get('/api/twitter/health', (_req, res) => {
+  res.json({
+    success: true,
+    accounts: [...twitterHealth.entries()].map(([name, h]) => ({ name, ...h })),
+  });
+});
+
 // Serve static build from dist folder
 app.use(express.static(path.join(__dirname, 'dist')));
 app.get('*', (_req, res) => {
@@ -1186,4 +1314,8 @@ app.listen(PORT, () => {
       startTelegramListener(id).catch(console.error);
     }
   }, 3000);
+
+  // Twitter oturumlarını açılışta ve 6 saatte bir kontrol et.
+  setTimeout(() => { checkTwitterSessions().catch(console.error); }, 20000);
+  setInterval(() => { checkTwitterSessions().catch(console.error); }, HEALTH_INTERVAL_MS);
 });
