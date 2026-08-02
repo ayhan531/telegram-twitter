@@ -71,16 +71,21 @@ function rfc3986Encode(str) {
   return encodeURIComponent(str).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
-function buildOAuth1Header(method, targetUrl, consumerKey, consumerSecret, accessToken, accessTokenSecret) {
+function buildOAuth1Header(method, targetUrl, consumerKey = '', consumerSecret = '', accessToken = '', accessTokenSecret = '') {
   const urlObj = new URL(targetUrl);
   const baseUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
 
+  const ck  = (consumerKey || '').trim();
+  const cs  = (consumerSecret || '').trim();
+  const at  = (accessToken || '').trim();
+  const ats = (accessTokenSecret || '').trim();
+
   const oauthParams = {
-    oauth_consumer_key:     consumerKey.trim(),
+    oauth_consumer_key:     ck,
     oauth_nonce:            crypto.randomBytes(16).toString('hex'),
     oauth_signature_method: 'HMAC-SHA1',
     oauth_timestamp:        Math.floor(Date.now() / 1000).toString(),
-    oauth_token:            accessToken.trim(),
+    oauth_token:            at,
     oauth_version:          '1.0',
   };
 
@@ -95,7 +100,7 @@ function buildOAuth1Header(method, targetUrl, consumerKey, consumerSecret, acces
     .join('&');
 
   const baseString = `${method.toUpperCase()}&${rfc3986Encode(baseUrl)}&${rfc3986Encode(paramString)}`;
-  const signingKey = `${rfc3986Encode(consumerSecret.trim())}&${rfc3986Encode(accessTokenSecret.trim())}`;
+  const signingKey = `${rfc3986Encode(cs)}&${rfc3986Encode(ats)}`;
   oauthParams.oauth_signature = crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
 
   return 'OAuth ' + Object.keys(oauthParams)
@@ -527,18 +532,27 @@ app.post('/api/sync/test', async (req, res) => {
   for (const twAcc of twitterAccounts) {
     const c = twAcc.credentials || {};
     try {
-      const url = 'https://api.twitter.com/2/tweets';
-      const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
-        body: JSON.stringify({ text: formattedText }),
-      });
-      const d = await r.json();
-      if (r.ok && d.data?.id) {
-        results.push({ account: twAcc.name, success: true, tweetId: d.data.id });
+      if (Array.isArray(c.cookies) && c.cookies.length > 0) {
+        // Free & Unlimited Cookie Mode
+        const freeRes = await postTweetViaCookies(c.cookies, formattedText);
+        results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
+      } else if (c.consumerKey && c.consumerSecret) {
+        // Official API Key Mode
+        const url = 'https://api.twitter.com/2/tweets';
+        const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+          body: JSON.stringify({ text: formattedText }),
+        });
+        const d = await r.json();
+        if (r.ok && d.data?.id) {
+          results.push({ account: twAcc.name, success: true, tweetId: d.data.id });
+        } else {
+          results.push({ account: twAcc.name, success: false, error: JSON.stringify(d.errors || d.detail || d) });
+        }
       } else {
-        results.push({ account: twAcc.name, success: false, error: JSON.stringify(d.errors || d.detail || d) });
+        results.push({ account: twAcc.name, success: false, error: 'Twitter hesabı için giriş bilgisi/çerez bulunamadı.' });
       }
     } catch (e) {
       results.push({ account: twAcc.name, success: false, error: e.message });
