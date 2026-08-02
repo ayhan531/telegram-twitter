@@ -6,17 +6,23 @@ import {
 
 export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const [activeModal, setActiveModal] = useState(null); // 'telegram' | 'twitter' | null
-  const [twTab, setTwTab] = useState('auth_token'); // 'auth_token' (XActions method - Easy & Unlimited) | 'api_keys'
+  const [twTab, setTwTab] = useState('auto_login'); // 'auto_login' (Default & Easy) | 'auth_token' | 'api_keys'
 
-  // ── Twitter State ──
+  // ── Twitter Auto Login State ──
+  const [twUsername, setTwUsername] = useState('');
+  const [twPassword, setTwPassword] = useState('');
+  const [twEmail,    setTwEmail]    = useState('');
+
+  // ── Twitter Token / API Keys State ──
   const [authToken,         setAuthToken]         = useState('');
+  const [cookieJson,        setCookieJson]        = useState('');
   const [consumerKey,       setConsumerKey]       = useState('');
   const [consumerSecret,    setConsumerSecret]    = useState('');
   const [accessToken,       setAccessToken]       = useState('');
   const [accessTokenSecret, setAccessTokenSecret] = useState('');
   const [twStatus,          setTwStatus]          = useState('idle'); // idle | loading | done | error
   const [twError,           setTwError]           = useState('');
-  const [showSecrets,       setShowSecrets]       = useState({ cs: false, ats: false });
+  const [showSecrets,       setShowSecrets]       = useState({ cs: false, ats: false, pass: false });
 
   // ── Telegram QR State ──
   const [tgStep,      setTgStep]      = useState('idle');
@@ -30,15 +36,47 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
     return () => clearInterval(pollRef.current);
   }, []);
 
-  // ── Twitter Verification (XActions auth_token / x-use Cookie-Editor OR API keys) ──
-  const [cookieJson, setCookieJson] = useState('');
-
   const handleVerifyTwitter = async () => {
     setTwStatus('loading');
     setTwError('');
 
     try {
-      if (twTab === 'auth_token' || twTab === 'cookie_json') {
+      if (twTab === 'auto_login') {
+        if (!twUsername.trim() || !twPassword.trim()) {
+          throw new Error('Lütfen Twitter kullanıcı adınızı ve şifrenizi girin.');
+        }
+
+        const res = await fetch('/api/twitter/free-login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: twUsername.trim(),
+            password: twPassword.trim(),
+            email: twEmail.trim() || undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+
+        const username = `@${data.user?.username || twUsername.replace(/^@/, '')}`;
+        const newAccount = {
+          id: `acc-tw-${Date.now()}`,
+          platform: 'twitter',
+          name: data.user?.name || username,
+          username,
+          status: 'connected',
+          avatarColor: 'bg-neutral-800',
+          credentials: {
+            cookies: data.cookies,
+            username: twUsername.trim(),
+          },
+        };
+
+        setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
+        onShowToast(`Twitter hesabı (${username}) otomatik giriş ile bağlandı! 🎉`, 'success');
+        setTimeout(() => setActiveModal(null), 1200);
+
+      } else if (twTab === 'auth_token' || twTab === 'cookie_json') {
         const payload = twTab === 'cookie_json'
           ? { cookieJson: cookieJson.trim() }
           : { cookies: [`auth_token=${authToken.trim()}`], authToken: authToken.trim() };
@@ -72,7 +110,6 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           },
         };
 
-        // Allow multi-account adding (filter only duplicate username)
         setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
         onShowToast(`Twitter hesabı (${username}) bağlandı! 🎉`, 'success');
         setTimeout(() => setActiveModal(null), 1200);
@@ -416,54 +453,91 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
             </div>
 
             {/* Mode Switcher Tabs */}
-            <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-950 rounded-xl border border-slate-800">
+            <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800 text-[10px]">
               <button
-                onClick={() => setTwTab('auth_token')}
-                className={`py-2 rounded-lg text-[11px] font-bold transition flex items-center justify-center space-x-1 ${
-                  twTab === 'auth_token'
+                onClick={() => setTwTab('auto_login')}
+                className={`py-2 rounded-lg font-bold transition flex items-center justify-center space-x-1 ${
+                  twTab === 'auto_login'
                     ? 'bg-emerald-600 text-white shadow-md'
                     : 'text-slate-400 hover:text-white'
                 }`}>
-                <ShieldCheck size={13} />
+                <span>🚀 Otomatik Giriş</span>
+              </button>
+              <button
+                onClick={() => setTwTab('auth_token')}
+                className={`py-2 rounded-lg font-bold transition flex items-center justify-center space-x-1 ${
+                  twTab === 'auth_token'
+                    ? 'bg-sky-600 text-white shadow-md'
+                    : 'text-slate-400 hover:text-white'
+                }`}>
+                <ShieldCheck size={12} />
                 <span>auth_token</span>
               </button>
               <button
                 onClick={() => setTwTab('cookie_json')}
-                className={`py-2 rounded-lg text-[11px] font-bold transition flex items-center justify-center space-x-1 ${
+                className={`py-2 rounded-lg font-bold transition flex items-center justify-center space-x-1 ${
                   twTab === 'cookie_json'
-                    ? 'bg-sky-600 text-white shadow-md'
+                    ? 'bg-indigo-600 text-white shadow-md'
                     : 'text-slate-400 hover:text-white'
                 }`}>
                 <span>x-use JSON</span>
               </button>
               <button
                 onClick={() => setTwTab('api_keys')}
-                className={`py-2 rounded-lg text-[11px] font-bold transition flex items-center justify-center space-x-1 ${
+                className={`py-2 rounded-lg font-bold transition flex items-center justify-center space-x-1 ${
                   twTab === 'api_keys'
-                    ? 'bg-indigo-600 text-white shadow-md'
+                    ? 'bg-slate-800 text-white shadow-md'
                     : 'text-slate-400 hover:text-white'
                 }`}>
-                <Key size={13} />
+                <Key size={12} />
                 <span>API Keys</span>
               </button>
             </div>
 
-            {/* MODE 1: XActions auth_token (Unlimited & Easy) */}
+            {/* MODE 1: Direct Auto Login (Username + Password) */}
+            {twTab === 'auto_login' && (
+              <div className="space-y-3">
+                <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-xs text-emerald-200 space-y-1.5 leading-relaxed">
+                  <p className="font-bold text-emerald-300 flex items-center space-x-1 text-sm">
+                    <span>🚀 1-Tıkla Otomatik Giriş (Sıfır Kopyalama!)</span>
+                  </p>
+                  <p>Kopyala-yapıştır yapmana gerek yok! Twitter kullanıcı adını ve şifreni gir, arkadaki betik otomatik giriş yapıp tüm çerez ve token'ları kendisi çekip bağlasın!</p>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">Twitter Kullanıcı Adı (veya E-posta / Telefon)</label>
+                  <input type="text" value={twUsername} onChange={e => setTwUsername(e.target.value)} placeholder="@kullaniciadi veya e-posta"
+                    className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono border-emerald-500/30 focus:border-emerald-500" />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">Twitter Şifresi</label>
+                  <div className="relative">
+                    <input type={showSecrets.pass ? 'text' : 'password'} value={twPassword} onChange={e => setTwPassword(e.target.value)} placeholder="Şifreniz"
+                      className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono border-emerald-500/30 focus:border-emerald-500" />
+                    <button type="button" onClick={() => setShowSecrets(p => ({ ...p, pass: !p.pass }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
+                      {showSecrets.pass ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-400 block mb-0.5">E-posta Adresi (İsteğe Bağlı)</label>
+                  <p className="text-[10px] text-slate-500 mb-1">Twitter yeni sunucudan girişte şüpheli işlem tespiti için ek e-posta doğrulaması isterse kullanılır.</p>
+                  <input type="email" value={twEmail} onChange={e => setTwEmail(e.target.value)} placeholder="ornek@gmail.com (İsteğe bağlı)"
+                    className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+                </div>
+              </div>
+            )}
+
+            {/* MODE 2: XActions auth_token (Unlimited & Easy) */}
             {twTab === 'auth_token' && (
               <div className="space-y-4">
-                <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-xs text-emerald-200 space-y-2 leading-relaxed">
-                  <p className="font-bold text-emerald-300 flex items-center space-x-1.5 text-sm">
-                    <span>⚡ XActions Yöntemi (Sınırsız & %100 Ücretsiz)</span>
+                <div className="p-4 rounded-xl bg-sky-950/30 border border-sky-500/30 text-xs text-sky-200 space-y-2 leading-relaxed">
+                  <p className="font-bold text-sky-300 flex items-center space-x-1.5 text-sm">
+                    <span>⚡ auth_token Yöntemi (Manuel Token)</span>
                   </p>
-                  <p>Developer portal şifreleriyle veya 1.500 tweet sınırı ile uğraşmazsın. Tarayıcıdaki <code className="bg-emerald-950 px-1 py-0.5 rounded text-emerald-300 font-bold">auth_token</code> değerini yapıştırman yeterlidir!</p>
-                  
-                  <div className="pt-2 border-t border-emerald-500/20 text-[11px] text-slate-300 space-y-1">
-                    <p className="font-bold text-white">auth_token Nasıl Alınır? (30 Saniye):</p>
-                    <p>1. Bilgisayardan <a href="https://x.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline font-bold">x.com</a> adresine git ve hesabına gir.</p>
-                    <p>2. Klavyeden <strong>F12</strong> tuşuna bas (veya Sağ Tık → İncele).</p>
-                    <p>3. Üstteki <strong>Application (Uygulama)</strong> veya <strong>Storage</strong> sekmesine tıkla.</p>
-                    <p>4. Sol menüden <strong>Cookies → https://x.com</strong> tıklayıp listeden <code className="text-sky-300 font-bold">auth_token</code> değerini kopyala.</p>
-                  </div>
+                  <p>Tarayıcıdaki <code className="bg-sky-950 px-1 py-0.5 rounded text-sky-300 font-bold">auth_token</code> değerini yapıştırarak manuel bağlanmak için kullanılır.</p>
                 </div>
 
                 <div>
@@ -475,7 +549,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                     value={authToken}
                     onChange={e => setAuthToken(e.target.value)}
                     placeholder="Örn: 6a7f8e9d0c1b2a3f..."
-                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-emerald-500/30 focus:border-emerald-500"
+                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
                   />
                 </div>
               </div>
