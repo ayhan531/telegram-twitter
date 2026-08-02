@@ -1,13 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Radio, Plus, Trash2, CheckCircle2, ExternalLink,
-  Eye, EyeOff, Loader2, QrCode, AlertCircle, Info, RefreshCw
+  Eye, EyeOff, Loader2, QrCode, AlertCircle, Info, RefreshCw, Key, ShieldCheck
 } from 'lucide-react';
 
 export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const [activeModal, setActiveModal] = useState(null); // 'telegram' | 'twitter' | null
+  const [twTab, setTwTab] = useState('auth_token'); // 'auth_token' (XActions method - Easy & Unlimited) | 'api_keys'
 
-  // ── Twitter Form State ──
+  // ── Twitter State ──
+  const [authToken,         setAuthToken]         = useState('');
   const [consumerKey,       setConsumerKey]       = useState('');
   const [consumerSecret,    setConsumerSecret]    = useState('');
   const [accessToken,       setAccessToken]       = useState('');
@@ -17,7 +19,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const [showSecrets,       setShowSecrets]       = useState({ cs: false, ats: false });
 
   // ── Telegram QR State ──
-  const [tgStep,      setTgStep]      = useState('idle'); // idle | loading | qr | done | error
+  const [tgStep,      setTgStep]      = useState('idle');
   const [qrDataUrl,   setQrDataUrl]   = useState('');
   const [sessionId,   setSessionId]   = useState('');
   const [tgError,     setTgError]     = useState('');
@@ -28,51 +30,85 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
     return () => clearInterval(pollRef.current);
   }, []);
 
-  // ── Twitter Verification ──
+  // ── Twitter Verification (XActions auth_token OR API keys) ──
   const handleVerifyTwitter = async () => {
-    if (!consumerKey.trim() || !consumerSecret.trim() || !accessToken.trim() || !accessTokenSecret.trim()) {
-      setTwError('Lütfen tüm 4 Twitter API anahtarını girin.');
-      return;
-    }
     setTwStatus('loading');
     setTwError('');
 
     try {
-      const res = await fetch('/api/twitter/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          consumerKey: consumerKey.trim(),
-          consumerSecret: consumerSecret.trim(),
-          accessToken: accessToken.trim(),
-          accessTokenSecret: accessTokenSecret.trim(),
-        }),
-      });
-      const data = await res.json();
-      if (!data.success) throw new Error(data.error);
+      if (twTab === 'auth_token') {
+        if (!authToken.trim()) {
+          throw new Error('Lütfen x.com hesabınızdan aldığınız auth_token değerini girin.');
+        }
 
-      setTwStatus('done');
-      const accountName = data.user?.name || data.user?.username || 'Twitter Hesabı';
-      const username = `@${data.user?.username || 'twitter'}`;
+        const res = await fetch('/api/twitter/cookie-verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cookies: [`auth_token=${authToken.trim()}`],
+            authToken: authToken.trim(),
+          }),
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
 
-      const newAccount = {
-        id: `acc-tw-${Date.now()}`,
-        platform: 'twitter',
-        name: accountName,
-        username,
-        status: 'connected',
-        avatarColor: 'bg-neutral-800',
-        credentials: {
-          consumerKey: consumerKey.trim(),
-          consumerSecret: consumerSecret.trim(),
-          accessToken: accessToken.trim(),
-          accessTokenSecret: accessTokenSecret.trim(),
-        },
-      };
+        const username = `@${data.user?.username || 'twitter'}`;
+        const newAccount = {
+          id: `acc-tw-${Date.now()}`,
+          platform: 'twitter',
+          name: data.user?.name || data.user?.username || 'Twitter Hesabı',
+          username,
+          status: 'connected',
+          avatarColor: 'bg-neutral-800',
+          credentials: {
+            cookies: data.cookies || [`auth_token=${authToken.trim()}`],
+            authToken: authToken.trim(),
+          },
+        };
 
-      setAccounts(prev => [...prev.filter(a => a.platform !== 'twitter'), newAccount]);
-      onShowToast(`Twitter hesabı (${username}) başarıyla bağlandı!`, 'success');
-      setTimeout(() => setActiveModal(null), 1200);
+        setAccounts(prev => [...prev.filter(a => a.platform !== 'twitter'), newAccount]);
+        onShowToast(`Twitter hesabı (${username}) Sınırsız Mod ile bağlandı! 🎉`, 'success');
+        setTimeout(() => setActiveModal(null), 1200);
+
+      } else {
+        // API Keys mode
+        if (!consumerKey.trim() || !consumerSecret.trim() || !accessToken.trim() || !accessTokenSecret.trim()) {
+          throw new Error('Lütfen tüm 4 Twitter API anahtarını doldurun.');
+        }
+
+        const res = await fetch('/api/twitter/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            consumerKey: consumerKey.trim(),
+            consumerSecret: consumerSecret.trim(),
+            accessToken: accessToken.trim(),
+            accessTokenSecret: accessTokenSecret.trim(),
+          }),
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error);
+
+        const username = `@${data.user?.username || 'twitter'}`;
+        const newAccount = {
+          id: `acc-tw-${Date.now()}`,
+          platform: 'twitter',
+          name: data.user?.name || data.user?.username || 'Twitter Hesabı',
+          username,
+          status: 'connected',
+          avatarColor: 'bg-neutral-800',
+          credentials: {
+            consumerKey: consumerKey.trim(),
+            consumerSecret: consumerSecret.trim(),
+            accessToken: accessToken.trim(),
+            accessTokenSecret: accessTokenSecret.trim(),
+          },
+        };
+
+        setAccounts(prev => [...prev.filter(a => a.platform !== 'twitter'), newAccount]);
+        onShowToast(`Twitter hesabı (${username}) bağlandı!`, 'success');
+        setTimeout(() => setActiveModal(null), 1200);
+      }
     } catch (err) {
       setTwStatus('error');
       setTwError(err.message);
@@ -118,7 +154,6 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           const accountName = `${data.user?.firstName || ''} ${data.user?.lastName || ''}`.trim() || 'Telegram';
           const username = data.user?.username ? `@${data.user.username}` : data.user?.phone || 'Telegram';
 
-          // Store session on server
           fetch('/api/telegram/session/store', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -180,7 +215,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
             <span>Hesap Bağlantıları</span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Telegram kanalından gelen mesajları otomatik tweet atmak için Telegram ve Twitter hesaplarını bağla.
+            Telegram kanallarından gelen mesajları ücretsiz ve sınırsız otomatik tweet atmak için hesaplarını bağla.
           </p>
         </div>
       </div>
@@ -226,7 +261,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
               </div>
             ) : (
               <p className="text-xs text-slate-400 leading-relaxed">
-                Telegram hesabını bağlayarak yönettiğin tüm kanalları, sohbet gruplarını ve özel mesajları anında yakalayabilirsin.
+                Telegram hesabını bağlayarak yönettiğin veya üye olduğun kanalları, sohbet gruplarını anında dinlemeye başla.
               </p>
             )}
           </div>
@@ -246,7 +281,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                 <div className="w-12 h-12 rounded-xl bg-neutral-800 text-white font-black flex items-center justify-center text-2xl border border-neutral-700 shadow-lg">𝕏</div>
                 <div>
                   <h3 className="font-bold text-base text-white">Twitter / X Hesabı</h3>
-                  <p className="text-xs text-slate-400">Tweet göndermek için bağla</p>
+                  <p className="text-xs text-slate-400">Ücretsiz & Sınırsız Tweet</p>
                 </div>
               </div>
               {twitterAccounts.length > 0 ? (
@@ -265,7 +300,12 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                 {twitterAccounts.map(acc => (
                   <div key={acc.id} className="flex items-center justify-between">
                     <div>
-                      <p className="text-xs font-bold text-white">{acc.name}</p>
+                      <div className="flex items-center space-x-1.5">
+                        <p className="text-xs font-bold text-white">{acc.name}</p>
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 border border-emerald-500/30 font-bold">
+                          {acc.credentials?.authToken ? 'XActions Sınırsız' : 'API Key'}
+                        </span>
+                      </div>
                       <p className="text-[11px] text-sky-400">{acc.username}</p>
                     </div>
                     <button onClick={() => removeAccount(acc.id)} className="p-1.5 rounded-lg text-rose-400 hover:bg-rose-950/40 border border-rose-500/20">
@@ -276,7 +316,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
               </div>
             ) : (
               <p className="text-xs text-slate-400 leading-relaxed">
-                Twitter API anahtarlarını girerek kesintisiz ve %100 resmi otomatik tweet akışını başlat.
+                Developer portal şifreleriyle uğraşmadan, <strong>XActions yöntemi (auth_token)</strong> ile %100 ücretsiz ve kota sınırı olmadan hesabını bağla!
               </p>
             )}
           </div>
@@ -284,7 +324,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           <button onClick={() => setActiveModal('twitter')}
             className="w-full py-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-neutral-600 text-white font-bold text-xs shadow-md transition flex items-center justify-center space-x-2">
             <span className="font-black text-sm">𝕏</span>
-            <span>{twitterAccounts.length > 0 ? 'Twitter Anahtarlarını Güncelle' : '𝕏 Twitter Hesabı Bağla'}</span>
+            <span>{twitterAccounts.length > 0 ? 'Twitter Hesabını Değiştir / Yenile' : '𝕏 Twitter Bağla (Sınırsız & Ücretsiz)'}</span>
           </button>
         </div>
 
@@ -357,63 +397,120 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
       {/* TWITTER MODAL */}
       {activeModal === 'twitter' && (
         <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-          <div className="w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-6 my-8 space-y-4 max-h-[90vh] overflow-y-auto">
+          <div className="w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-6 my-8 space-y-5 max-h-[90vh] overflow-y-auto">
+            
+            {/* Modal Header */}
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h3 className="font-bold text-white text-base flex items-center space-x-2">
                 <span className="text-lg">𝕏</span>
-                <span>Twitter / X API Anahtarları</span>
+                <span>Twitter Hesabı Bağla</span>
               </h3>
               <button onClick={() => setActiveModal(null)} className="text-slate-400 hover:text-white text-sm font-bold">✕</button>
             </div>
 
-            {/* Helper Instructions */}
-            <div className="p-3.5 rounded-xl bg-slate-800/80 border border-slate-700 text-xs text-slate-300 space-y-1.5 leading-relaxed">
-              <p className="font-bold text-white flex items-center space-x-1">
-                <Info size={14} className="text-sky-400" />
-                <span>Anahtarları nereden alacaksın?</span>
-              </p>
-              <p>1. <a href="https://developer.twitter.com/en/portal/dashboard" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline font-semibold">developer.twitter.com</a> adresine git.</p>
-              <p>2. Uygulamanı seç → <strong>Keys and tokens</strong> sekmesine gir.</p>
-              <p>3. <strong>Consumer Keys</strong> → API Key & API Secret kopyala.</p>
-              <p>4. <strong>Authentication Tokens</strong> → Access Token & Access Token Secret kopyala (yoksa <i>Generate</i> bas).</p>
+            {/* Mode Switcher Tabs */}
+            <div className="grid grid-cols-2 gap-2 p-1 bg-slate-950 rounded-xl border border-slate-800">
+              <button
+                onClick={() => setTwTab('auth_token')}
+                className={`py-2 rounded-lg text-xs font-bold transition flex items-center justify-center space-x-1.5 ${
+                  twTab === 'auth_token'
+                    ? 'bg-emerald-600 text-white shadow-md'
+                    : 'text-slate-400 hover:text-white'
+                }`}>
+                <ShieldCheck size={14} />
+                <span>XActions (Sınırsız & Ücretsiz)</span>
+              </button>
+              <button
+                onClick={() => setTwTab('api_keys')}
+                className={`py-2 rounded-lg text-xs font-bold transition flex items-center justify-center space-x-1.5 ${
+                  twTab === 'api_keys'
+                    ? 'bg-indigo-600 text-white shadow-md'
+                    : 'text-slate-400 hover:text-white'
+                }`}>
+                <Key size={14} />
+                <span>API Keys (Developer Portal)</span>
+              </button>
             </div>
 
-            {/* Inputs */}
-            <div className="space-y-3">
-              <div>
-                <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key (Consumer Key)</label>
-                <input type="text" value={consumerKey} onChange={e => setConsumerKey(e.target.value)} placeholder="API Key"
-                  className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
-              </div>
+            {/* MODE 1: XActions auth_token (Unlimited & Easy) */}
+            {twTab === 'auth_token' && (
+              <div className="space-y-4">
+                <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-xs text-emerald-200 space-y-2 leading-relaxed">
+                  <p className="font-bold text-emerald-300 flex items-center space-x-1.5 text-sm">
+                    <span>⚡ XActions Yöntemi (Sınırsız & %100 Ücretsiz)</span>
+                  </p>
+                  <p>Developer portal şifreleriyle veya 1.500 tweet sınırı ile uğraşmazsın. Tarayıcıdaki <code className="bg-emerald-950 px-1 py-0.5 rounded text-emerald-300 font-bold">auth_token</code> değerini yapıştırman yeterlidir!</p>
+                  
+                  <div className="pt-2 border-t border-emerald-500/20 text-[11px] text-slate-300 space-y-1">
+                    <p className="font-bold text-white">auth_token Nasıl Alınır? (30 Saniye):</p>
+                    <p>1. Bilgisayardan <a href="https://x.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline font-bold">x.com</a> adresine git ve hesabına gir.</p>
+                    <p>2. Klavyeden <strong>F12</strong> tuşuna bas (veya Sağ Tık → İncele).</p>
+                    <p>3. Üstteki <strong>Application (Uygulama)</strong> veya <strong>Storage</strong> sekmesine tıkla.</p>
+                    <p>4. Sol menüden <strong>Cookies → https://x.com</strong> tıklayıp listeden <code className="text-sky-300 font-bold">auth_token</code> değerini kopyala.</p>
+                  </div>
+                </div>
 
-              <div>
-                <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key Secret (Consumer Secret)</label>
-                <div className="relative">
-                  <input type={showSecrets.cs ? 'text' : 'password'} value={consumerSecret} onChange={e => setConsumerSecret(e.target.value)} placeholder="API Key Secret"
-                    className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
-                  <button type="button" onClick={() => setShowSecrets(p => ({ ...p, cs: !p.cs }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
-                    {showSecrets.cs ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
+                    auth_token Değeri
+                  </label>
+                  <input
+                    type="text"
+                    value={authToken}
+                    onChange={e => setAuthToken(e.target.value)}
+                    placeholder="Örn: 6a7f8e9d0c1b2a3f..."
+                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-emerald-500/30 focus:border-emerald-500"
+                  />
                 </div>
               </div>
+            )}
 
-              <div>
-                <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token</label>
-                <input type="text" value={accessToken} onChange={e => setAccessToken(e.target.value)} placeholder="Access Token"
-                  className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
-              </div>
+            {/* MODE 2: Official Developer API Keys */}
+            {twTab === 'api_keys' && (
+              <div className="space-y-3">
+                <div className="p-3.5 rounded-xl bg-slate-800/80 border border-slate-700 text-xs text-slate-300 space-y-1 leading-relaxed">
+                  <p className="font-bold text-white flex items-center space-x-1">
+                    <Info size={14} className="text-sky-400" />
+                    <span>Developer Portal API Anahtarları</span>
+                  </p>
+                  <p><a href="https://developer.twitter.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 underline">developer.twitter.com</a> adresindeki App'inizden 4 anahtarı girin (Ayda maks 1.500 tweet).</p>
+                </div>
 
-              <div>
-                <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token Secret</label>
-                <div className="relative">
-                  <input type={showSecrets.ats ? 'text' : 'password'} value={accessTokenSecret} onChange={e => setAccessTokenSecret(e.target.value)} placeholder="Access Token Secret"
-                    className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
-                  <button type="button" onClick={() => setShowSecrets(p => ({ ...p, ats: !p.ats }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
-                    {showSecrets.ats ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key (Consumer Key)</label>
+                  <input type="text" value={consumerKey} onChange={e => setConsumerKey(e.target.value)} placeholder="API Key"
+                    className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">API Key Secret (Consumer Secret)</label>
+                  <div className="relative">
+                    <input type={showSecrets.cs ? 'text' : 'password'} value={consumerSecret} onChange={e => setConsumerSecret(e.target.value)} placeholder="API Key Secret"
+                      className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+                    <button type="button" onClick={() => setShowSecrets(p => ({ ...p, cs: !p.cs }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
+                      {showSecrets.cs ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token</label>
+                  <input type="text" value={accessToken} onChange={e => setAccessToken(e.target.value)} placeholder="Access Token"
+                    className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">Access Token Secret</label>
+                  <div className="relative">
+                    <input type={showSecrets.ats ? 'text' : 'password'} value={accessTokenSecret} onChange={e => setAccessTokenSecret(e.target.value)} placeholder="Access Token Secret"
+                      className="w-full px-3 py-2 pr-9 rounded-xl glass-input text-white text-xs font-mono" />
+                    <button type="button" onClick={() => setShowSecrets(p => ({ ...p, ats: !p.ats }))} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
+                      {showSecrets.ats ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
 
             {twError && (
               <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300 leading-relaxed">
@@ -426,9 +523,9 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                 İptal
               </button>
               <button onClick={handleVerifyTwitter} disabled={twStatus === 'loading'}
-                className="flex-1 py-2.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-neutral-600 text-white font-bold text-xs flex items-center justify-center space-x-2 transition shadow-md">
-                {twStatus === 'loading' ? <Loader2 size={15} className="animate-spin text-sky-400" /> : <span className="font-black text-sm">𝕏</span>}
-                <span>{twStatus === 'loading' ? 'Doğrulanıyor...' : '🔌 Bağlantıyı Test Et & Kaydet'}</span>
+                className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center justify-center space-x-2 transition shadow-md">
+                {twStatus === 'loading' ? <Loader2 size={15} className="animate-spin text-white" /> : <ShieldCheck size={16} />}
+                <span>{twStatus === 'loading' ? 'Doğrulanıyor...' : (twTab === 'auth_token' ? '⚡ Sınırsız Modda Bağla' : '🔌 API Keys Bağla')}</span>
               </button>
             </div>
           </div>

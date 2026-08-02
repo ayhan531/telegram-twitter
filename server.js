@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
+import { Scraper } from 'agent-twitter-client';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -310,11 +311,96 @@ app.post('/api/twitter/verify', async (req, res) => {
   }
 });
 
+app.post('/api/twitter/free-login', async (req, res) => {
+  const { username, password, email, twoFactorSecret } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Kullanıcı adı ve şifre gereklidir.' });
+  }
+
+  try {
+    const scraper = new Scraper();
+    await scraper.login(username.trim(), password.trim(), email?.trim(), twoFactorSecret?.trim());
+    
+    const isLoggedIn = await scraper.isLoggedIn();
+    if (!isLoggedIn) {
+      return res.status(400).json({ success: false, error: 'Giriş yapılamadı. Şifre veya e-posta doğrulamasını kontrol edin.' });
+    }
+
+    const cookies = await scraper.getCookies();
+    const cookieStrings = cookies.map(c => typeof c === 'string' ? c : (c.key && c.value ? `${c.key}=${c.value}` : String(c)));
+    
+    return res.json({
+      success: true,
+      user: { username: username.replace(/^@/, ''), name: username.replace(/^@/, '') },
+      cookies: cookieStrings,
+    });
+  } catch (err) {
+    return res.status(400).json({ success: false, error: 'Giriş hatası: ' + err.message });
+  }
+});
+
+app.post('/api/twitter/cookie-verify', async (req, res) => {
+  const { cookies, authToken, ct0 } = req.body;
+  
+  let cookieArray = [];
+  if (Array.isArray(cookies) && cookies.length) {
+    cookieArray = cookies;
+  } else if (authToken && ct0) {
+    cookieArray = [`auth_token=${authToken.trim()}`, `ct0=${ct0.trim()}`];
+  } else {
+    return res.status(400).json({ success: false, error: 'Lütfen çerezlerinizi (auth_token ve ct0) veya cookie dizisini girin.' });
+  }
+
+  try {
+    const scraper = new Scraper();
+    await scraper.setCookies(cookieArray);
+    const isLoggedIn = await scraper.isLoggedIn();
+
+    if (!isLoggedIn) {
+      return res.status(400).json({ success: false, error: 'Çerezler geçersiz veya süresi dolmuş.' });
+    }
+
+    let username = 'Twitter Kullanıcısı';
+    try {
+      const me = await scraper.getMe();
+      if (me?.username) username = me.username;
+    } catch (_) {}
+
+    return res.json({
+      success: true,
+      user: { username, name: username },
+      cookies: cookieArray,
+    });
+  } catch (err) {
+    return res.status(400).json({ success: false, error: 'Çerez doğrulama hatası: ' + err.message });
+  }
+});
+
+async function postTweetViaCookies(cookies, text) {
+  try {
+    const scraper = new Scraper();
+    await scraper.setCookies(cookies);
+    const res = await scraper.sendTweet(text);
+    return { success: true, res };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
 app.post('/api/twitter/send', async (req, res) => {
-  const { consumerKey, consumerSecret, accessToken, accessTokenSecret, text } = req.body;
+  const { cookies, consumerKey, consumerSecret, accessToken, accessTokenSecret, text } = req.body;
   if (!text) return res.status(400).json({ success: false, error: 'Tweet metni boş olamaz.' });
+
+  // 1. If cookies provided -> Free & Unlimited post via scraper
+  if (Array.isArray(cookies) && cookies.length > 0) {
+    const freeRes = await postTweetViaCookies(cookies, text);
+    if (freeRes.success) return res.json({ success: true });
+    return res.status(400).json({ success: false, error: freeRes.error });
+  }
+
+  // 2. Otherwise try official OAuth 1.0a API keys
   if (!consumerKey || !consumerSecret || !accessToken || !accessTokenSecret) {
-    return res.status(400).json({ success: false, error: 'Twitter API anahtarları eksik.' });
+    return res.status(400).json({ success: false, error: 'Twitter API anahtarları veya çerezler eksik.' });
   }
 
   try {
@@ -354,7 +440,7 @@ app.post('/api/twitter/send', async (req, res) => {
     if (rawError.toLowerCase().includes('credits depleted') || rawError.toLowerCase().includes('limit')) {
       return res.status(400).json({
         success: false,
-        error: 'Twitter Developer Hesabınızın Aylık Ücretsiz Tweet Kotası Doldu! (developer.twitter.com adresinden yeni bir Uygulama/Keys oluşturun veya hesabı yenileyin).'
+        error: 'Twitter API Kotası Doldu! Ücretsiz ve Sınırsız mod için Kullanıcı Adı/Şifre veya Çerez ile giriş yapın.'
       });
     }
 
@@ -565,16 +651,25 @@ async function executeSyncRule(rule, message, twitterAccounts) {
   for (const twAcc of twitterAccounts) {
     const c = twAcc.credentials || {};
     try {
-      const url = 'https://api.twitter.com/2/tweets';
-      const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
-        body: JSON.stringify({ text }),
-      });
-      const d = await r.json();
-      const ok = r.ok && d.data?.id;
-      results.push({ account: twAcc.name, success: !!ok, error: d.errors ? d.errors[0]?.message : (d.detail || d.title) });
+      if (Array.isArray(c.cookies) && c.cookies.length > 0) {
+        // Free & Unlimited Cookie Mode
+        const freeRes = await postTweetViaCookies(c.cookies, text);
+        results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
+      } else if (c.consumerKey && c.consumerSecret) {
+        // Official API Key Mode
+        const url = 'https://api.twitter.com/2/tweets';
+        const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+          body: JSON.stringify({ text }),
+        });
+        const d = await r.json();
+        const ok = r.ok && d.data?.id;
+        results.push({ account: twAcc.name, success: !!ok, error: d.errors ? d.errors[0]?.message : (d.detail || d.title) });
+      } else {
+        results.push({ account: twAcc.name, success: false, error: 'Twitter hesabı için giriş bilgisi bulunamadı.' });
+      }
     } catch (e) {
       results.push({ account: twAcc.name, success: false, error: e.message });
     }
