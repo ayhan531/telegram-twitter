@@ -16,6 +16,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   // ── Twitter Token / API Keys State ──
   const [authToken,         setAuthToken]         = useState('');
   const [ctToken,           setCtToken]           = useState('');
+  const [twidToken,         setTwidToken]         = useState('');
   const [cookieJson,        setCookieJson]        = useState('');
   const [consumerKey,       setConsumerKey]       = useState('');
   const [consumerSecret,    setConsumerSecret]    = useState('');
@@ -81,13 +82,17 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
         const cookiesArray = [];
         if (authToken.trim()) cookiesArray.push(`auth_token=${authToken.trim()}`);
         if (ctToken.trim()) cookiesArray.push(`ct0=${ctToken.trim()}`);
+        if (twidToken.trim()) cookiesArray.push(`twid=${twidToken.trim()}`);
 
         const payload = twTab === 'cookie_json'
           ? { cookieJson: cookieJson.trim() }
-          : { cookies: cookiesArray, authToken: authToken.trim(), ct0: ctToken.trim() };
+          : { cookies: cookiesArray, authToken: authToken.trim(), ct0: ctToken.trim(), twid: twidToken.trim() };
 
         if (twTab === 'auth_token' && !authToken.trim()) {
           throw new Error('Lütfen x.com hesabınızdan aldığınız auth_token değerini girin.');
+        }
+        if (twTab === 'auth_token' && !ctToken.trim()) {
+          throw new Error('Lütfen ct0 değerini de girin. X, ct0 olmadan gönderimi reddediyor.');
         }
         if (twTab === 'cookie_json' && !cookieJson.trim()) {
           throw new Error('Lütfen Cookie-Editor eklentisinden kopyaladığınız JSON çerez metnini yapıştırın.');
@@ -502,21 +507,16 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
             {/* MODE 1: Direct Auto Login (Username + Password) */}
             {twTab === 'auto_login' && (
               <div className="space-y-3">
-                <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-xs text-emerald-200 space-y-1.5 leading-relaxed">
-                  <p className="font-bold text-emerald-300 flex items-center space-x-1 text-sm">
-                    <span>🚀 1-Tıkla Otomatik Giriş</span>
+                <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-500/40 text-xs text-red-200 space-y-1.5 leading-relaxed">
+                  <p className="font-bold text-red-300 flex items-center space-x-1 text-sm">
+                    <span>⛔ Bu Yöntem Artık Çalışmıyor</span>
                   </p>
-                  <p>Twitter kullanıcı adını ve şifreni gir, arkadaki betik otomatik giriş yapıp hesabı bağlasın.</p>
-                </div>
-
-                {/* Notice for Google/Apple SSO users */}
-                <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200 space-y-1">
-                  <p className="font-bold text-amber-300 flex items-center space-x-1">
-                    <span>🌐 Google veya Apple ile Giriş Yaptıysanız:</span>
+                  <p>
+                    X, sunucu üzerinden kullanıcı adı/şifre ile girişte kullanılan akışı kapattı.
+                    Bu sekme hangi bilgiyi girerseniz girin başarısız olur.
                   </p>
-                  <p>Google ile üye olduysan varsayılan şifren olmayabilir. Bu durumda üstten <strong>auth_token</strong> sekmesine geçerek 10 saniyede şifresiz bağlanabilirsin!</p>
                   <button type="button" onClick={() => setTwTab('auth_token')} className="mt-1 text-sky-400 font-bold underline block">
-                    ➜ Şifresiz Bağlan (auth_token Sekmesine Geç)
+                    ➜ Çerez Yöntemine Geç (Ücretsiz, Sınırsız, Kalıcı)
                   </button>
                 </div>
 
@@ -551,9 +551,17 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
               <div className="space-y-4">
                 <div className="p-4 rounded-xl bg-sky-950/30 border border-sky-500/30 text-xs text-sky-200 space-y-2 leading-relaxed">
                   <p className="font-bold text-sky-300 flex items-center space-x-1.5 text-sm">
-                    <span>⚡ auth_token Yöntemi (Manuel Token)</span>
+                    <span>⚡ Çerez Yöntemi (Ücretsiz &amp; Sınırsız)</span>
                   </p>
-                  <p>Tarayıcıdaki <code className="bg-sky-950 px-1 py-0.5 rounded text-sky-300 font-bold">auth_token</code> değerini yapıştırarak manuel bağlanmak için kullanılır.</p>
+                  <p>
+                    <strong>x.com</strong>'da oturumunuz açıkken <strong>F12</strong> → <strong>Application</strong> →
+                    <strong> Cookies</strong> → <code className="bg-sky-950 px-1 py-0.5 rounded text-sky-300 font-bold">https://x.com</code> yolunu
+                    açın ve aşağıdaki değerleri <strong>aynı anda</strong> kopyalayın.
+                  </p>
+                  <p className="text-sky-300/80">
+                    Bu üçlü aynı oturuma ait olmalıdır. Çıkış yaparsanız üçü birden geçersiz olur —
+                    sekmeyi açık bırakın, çerezler yıllarca geçerli kalır.
+                  </p>
                 </div>
 
                 <div>
@@ -581,8 +589,25 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                     className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
                   />
                   <p className="text-[10px] text-amber-300/80 mt-1.5 leading-relaxed">
-                    ct0, Twitter'ın CSRF doğrulama değeridir ve oturuma bağlıdır. Girilmezse tweet
-                    "Hata 32" ile reddedilebilir — auth_token ile aynı çerez listesinden kopyalayın.
+                    ct0, X'in CSRF doğrulama değeridir ve oturuma bağlıdır. Uydurulamaz —
+                    auth_token ile aynı çerez listesinden kopyalanmalıdır.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
+                    3. twid Değeri (İsteğe Bağlı)
+                  </label>
+                  <input
+                    type="text"
+                    value={twidToken}
+                    onChange={e => setTwidToken(e.target.value)}
+                    placeholder='u%3D1550123456789012345'
+                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
+                  />
+                  <p className="text-[10px] text-slate-400 mt-1.5 leading-relaxed">
+                    Hesap kimliğinizi taşır. Boş bırakırsanız sunucu bunu doğrulama sırasında
+                    kendisi tespit eder — yalnızca sorun yaşarsanız doldurun.
                   </p>
                 </div>
               </div>

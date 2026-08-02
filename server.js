@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
-import { Scraper } from 'agent-twitter-client';
+import { Rettiwt } from 'rettiwt-api';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -316,44 +316,22 @@ app.post('/api/twitter/verify', async (req, res) => {
   }
 });
 
-app.post('/api/twitter/free-login', async (req, res) => {
-  const { username, password, email, twoFactorSecret } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ success: false, error: 'Kullanıcı adı ve şifre gereklidir.' });
-  }
-
-  try {
-    const scraper = new Scraper();
-    await scraper.login(username.trim(), password.trim(), email?.trim(), twoFactorSecret?.trim());
-    
-    const isLoggedIn = await scraper.isLoggedIn();
-    if (!isLoggedIn) {
-      return res.status(400).json({ success: false, error: 'Giriş yapılamadı. Şifre veya e-posta doğrulamasını kontrol edin.' });
-    }
-
-    const cookies = await scraper.getCookies();
-    const cookieStrings = cookies.map(c => typeof c === 'string' ? c : (c.key && c.value ? `${c.key}=${c.value}` : String(c)));
-    
-    return res.json({
-      success: true,
-      user: { username: username.replace(/^@/, ''), name: username.replace(/^@/, '') },
-      cookies: cookieStrings,
-    });
-  } catch (err) {
-    let msg = err.message || '';
-    if (msg.includes('34') || msg.includes('does not exist') || msg.includes('page does not exist')) {
-      msg = 'Twitter güvenlik duvarı sunucudan şifreli girişi engelledi (Hata 34). Lütfen üstteki "auth_token" sekmesini seçip x.com\'dan alacağınız auth_token ile şifresiz ve sınırsız bağlanın.';
-    }
-    return res.status(400).json({ success: false, error: msg });
-  }
+// X, sunucudan kullanıcı adı/şifre ile girişte kullanılan onboarding akışını
+// (guest/activate) kapattı; bu uç nokta artık her koşulda başarısız oluyordu.
+// Kullanıcıyı boşuna bekletmek yerine doğru yönteme yönlendiriyoruz.
+app.post('/api/twitter/free-login', (_req, res) => {
+  return res.status(400).json({
+    success: false,
+    error: 'X, sunucu üzerinden şifreli girişi tamamen kapattı. Lütfen "Çerez (auth_token)" sekmesini kullanın — kalıcı, ücretsiz ve sınırsızdır.',
+  });
 });
 
 app.post('/api/twitter/cookie-verify', async (req, res) => {
-  const { cookies, authToken, ct0, cookieJson } = req.body;
-  
+  const { cookies, authToken, ct0, twid, cookieJson } = req.body;
+
   let cookieArray = [];
 
-  // Support x-use Cookie-Editor JSON format
+  // Cookie-Editor JSON aktarımı (tüm çerezleri içerir: auth_token, ct0, twid, kdt)
   if (cookieJson) {
     try {
       const parsed = typeof cookieJson === 'string' ? JSON.parse(cookieJson) : cookieJson;
@@ -365,51 +343,64 @@ app.post('/api/twitter/cookie-verify', async (req, res) => {
           return String(c);
         });
       }
-    } catch (_) {}
+    } catch (e) {
+      return res.status(400).json({ success: false, error: 'Çerez JSON metni okunamadı: ' + e.message });
+    }
   }
-  
+
   if (!cookieArray.length && Array.isArray(cookies) && cookies.length) {
     cookieArray = cookies;
   } else if (!cookieArray.length && authToken) {
     cookieArray = [`auth_token=${authToken.trim()}`];
-    if (ct0 && ct0.trim()) {
-      cookieArray.push(`ct0=${ct0.trim()}`);
-    }
+    if (ct0 && ct0.trim()) cookieArray.push(`ct0=${ct0.trim()}`);
+    if (twid && twid.trim()) cookieArray.push(`twid=${twid.trim()}`);
   }
 
   if (!cookieArray.length) {
-    return res.status(400).json({ success: false, error: 'Lütfen auth_token veya çerez bilgilerinizi girin.' });
+    return res.status(400).json({ success: false, error: 'Lütfen auth_token ve ct0 çerezlerinizi girin.' });
   }
-
-  // ct0'ı burada çözüp kaydediyoruz ki her tweet'te yeniden alınmasın.
-  const prepared = await prepareTwitterCookies(cookieArray);
-  if (prepared.error) {
-    return res.status(400).json({ success: false, error: prepared.error });
-  }
-  cookieArray = prepared.cookieStrings;
 
   try {
-    const verified = await verifyTwitterCookies(prepared.cookieMap);
-    if (verified.error) {
-      return res.status(400).json({ success: false, error: verified.error });
+    // Anahtarı burada üretip saklıyoruz; twid eksikse hesaptan türetiliyor.
+    const built = await buildRettiwtKey(cookieArray);
+    if (built.error) {
+      return res.status(400).json({ success: false, error: built.error });
     }
 
-    console.log(`[Twitter] Hesap doğrulandı: @${verified.username}`);
+    const account = built.account || await verifyTwitterCookies(built.cookieMap);
+    if (account.error) {
+      return res.status(400).json({ success: false, error: account.error });
+    }
+
+    console.log(`[Twitter] Hesap doğrulandı: @${account.username}`);
     return res.json({
       success: true,
-      user: { username: verified.username, name: verified.name },
-      cookies: cookieArray,
+      user: { username: account.username, name: account.name },
+      // Doğrulanmış, twid dahil eksiksiz çerez seti geri dönüyor ve kurallara kaydediliyor.
+      cookies: [
+        `auth_token=${built.cookieMap.get('auth_token')}`,
+        `ct0=${built.cookieMap.get('ct0')}`,
+        `twid=${normalizeTwid(built.cookieMap.get('twid')) || twidFromUserId(account.userId)}`,
+        ...(built.cookieMap.get('kdt') ? [`kdt=${built.cookieMap.get('kdt')}`] : []),
+      ],
     });
   } catch (err) {
     return res.status(400).json({ success: false, error: 'Çerez doğrulama hatası: ' + err.message });
   }
 });
 
-// agent-twitter-client'ın kullandığı web bearer token'ının aynısı.
-const TWITTER_BEARER = 'AAAAAAAAAAAAAAAAAAAAAFQODgEAAAAAVHTp76lzh3rFzcHbmHVvQxYYpTw%3DckAlMINMjmCwxUcaXbAN4XqJVdgMJaHqNOFgPMK0zN1qLqLQCF';
+// ═══════════════════════════════════════════════════════════════════════════
+//  TWITTER ─ Ücretsiz & Sınırsız Gönderim (rettiwt-api, x.com uç noktaları)
+// ═══════════════════════════════════════════════════════════════════════════
+// Not: Eski agent-twitter-client api.twitter.com/1.1 üzerinden çalışıyordu ve o
+// yol X tarafından kapatıldı (guest/activate artık 404 → "Hata 34"/"Hata 32").
+// rettiwt-api güncel x.com/i/api uç noktalarını ve web bearer'ını kullanır.
 
-// Çerez listesini {key: value} haritasına çevirir. Hem "a=b" düz metin, hem
-// Cookie-Editor'ün {name, value} / tough-cookie'nin {key, value} biçimlerini kabul eder.
+// x.com web istemcisinin bearer token'ı (rettiwt-api ile aynı).
+const TWITTER_BEARER = 'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+
+// Çerez listesini {key: value} haritasına çevirir. Düz "a=b" metnini,
+// Cookie-Editor'ün {name, value} ve tough-cookie'nin {key, value} biçimlerini kabul eder.
 function parseCookieMap(input) {
   const arr = Array.isArray(input) ? input : [input];
   const jar = new Map();
@@ -430,152 +421,221 @@ function parseCookieMap(input) {
   return jar;
 }
 
-// agent-twitter-client çerezleri "https://twitter.com" host-only kaydediyor, ama
-// istekler api.twitter.com / upload.twitter.com'a gidiyor. Domain=.twitter.com
-// eklenmezse çerezler o alt alan adlarına hiç gönderilmez.
-function toCookieStrings(jar) {
-  return [...jar.entries()].map(([k, v]) => `${k}=${v}; Domain=.twitter.com; Path=/; Secure; SameSite=None`);
+// twid, kullanıcı kimliğini taşır ve rettiwt için zorunludur. Tarayıcıdan
+// `u%3D1234567890` ya da `"u=1234567890"` biçiminde gelir; ikisini de kabul edip
+// tek biçime indiriyoruz. Elde yoksa hesap kimliğinden üretilebilir.
+function normalizeTwid(rawTwid) {
+  if (!rawTwid) return null;
+  const m = /u(?:%3D|=)(\d+)/i.exec(decodeURIComponent(rawTwid).replace(/"/g, '')) ||
+            /(\d{5,})/.exec(rawTwid);
+  return m ? `u%3D${m[1]}` : null;
 }
 
-// ct0 (CSRF) uydurulamaz — Twitter onu sunucu tarafında oturuma bağlar ve
-// eşleşmeyen değer "Could not authenticate you (32)" hatası verir. Kullanıcı ct0
-// girmediyse auth_token ile Twitter'dan gerçek bir tane aldırırız.
-async function fetchCt0(authToken) {
-  const attempts = [
-    { url: 'https://api.twitter.com/1.1/account/settings.json', headers: { authorization: `Bearer ${TWITTER_BEARER}` } },
-    { url: 'https://x.com/', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' } },
-  ];
-  for (const { url, headers } of attempts) {
-    try {
-      const r = await fetch(url, { headers: { ...headers, cookie: `auth_token=${authToken}` }, redirect: 'manual' });
-      const setCookies = typeof r.headers.getSetCookie === 'function'
-        ? r.headers.getSetCookie()
-        : [r.headers.get('set-cookie') || ''];
-      for (const sc of setCookies) {
-        const m = /(?:^|[;,\s])ct0=([^;,\s]+)/.exec(sc || '');
-        if (m && m[1] && m[1].length > 8) {
-          console.log(`[Twitter] ct0 otomatik alındı (${url})`);
-          return m[1];
-        }
-      }
-    } catch (e) {
-      console.warn(`[Twitter] ct0 alınamadı (${url}):`, e.message);
-    }
-  }
-  return null;
+function twidFromUserId(userId) {
+  return userId ? `u%3D${userId}` : null;
 }
 
-// Çerezleri doğrudan verify_credentials'a sorar. Kütüphanenin me()/isLoggedIn()
-// sarmalayıcıları hatayı yutuyor; burada Twitter'ın gerçek kodunu görebiliyoruz.
+// Çerezleri x.com'un kendi verify_credentials uç noktasına sorar. Hem hesabı
+// doğrular hem de twid üretmek için gereken sayısal kullanıcı kimliğini verir.
 async function verifyTwitterCookies(cookieMap) {
   const cookieHeader = [...cookieMap.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
-  const r = await fetch('https://api.twitter.com/1.1/account/verify_credentials.json', {
-    headers: {
-      authorization: `Bearer ${TWITTER_BEARER}`,
-      cookie: cookieHeader,
-      'x-csrf-token': cookieMap.get('ct0') || '',
-      'x-twitter-auth-type': 'OAuth2Session',
-      'x-twitter-active-user': 'yes',
-      'x-twitter-client-language': 'en',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-    },
-  });
-  const body = await r.text();
+  let r, body;
+  try {
+    r = await fetch('https://x.com/i/api/1.1/account/verify_credentials.json', {
+      headers: {
+        authorization: `Bearer ${TWITTER_BEARER}`,
+        cookie: cookieHeader,
+        'x-csrf-token': cookieMap.get('ct0') || '',
+        'x-twitter-auth-type': 'OAuth2Session',
+        'x-twitter-active-user': 'yes',
+        'x-twitter-client-language': 'en',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      },
+    });
+    body = await r.text();
+  } catch (e) {
+    return { error: 'Twitter\'a ulaşılamadı: ' + e.message };
+  }
+
   let data = null;
   try { data = JSON.parse(body); } catch (_) {}
 
   if (r.ok && data?.screen_name) {
-    return { username: data.screen_name, name: data.name || data.screen_name };
+    return {
+      username: data.screen_name,
+      name: data.name || data.screen_name,
+      userId: data.id_str || (data.id != null ? String(data.id) : null),
+    };
   }
 
   const code = data?.errors?.[0]?.code;
   const twMsg = data?.errors?.[0]?.message || body.slice(0, 200);
   console.error(`[Twitter] verify_credentials başarısız (HTTP ${r.status}, kod ${code}):`, twMsg);
+  return { error: describeTwitterError(code, r.status, twMsg) };
+}
 
-  if (code === 32) {
-    return { error: 'Twitter oturumu tanımadı (Hata 32). auth_token geçersiz veya süresi dolmuş. x.com\'da oturum açıp auth_token ve ct0 değerlerini yeniden kopyalayın.' };
+function describeTwitterError(code, status, fallback) {
+  if (code === 32 || status === 401) {
+    return 'Twitter oturumu tanımadı (Hata 32). auth_token geçersiz veya süresi dolmuş. x.com\'da oturumu açık tutarak auth_token, ct0 ve twid değerlerini yeniden kopyalayın.';
   }
-  if (code === 353 || r.status === 403) {
-    return { error: 'CSRF doğrulaması başarısız (ct0). auth_token ile ct0 aynı oturuma ait olmalı — ikisini de aynı anda x.com çerezlerinden kopyalayın.' };
+  if (code === 353 || status === 403) {
+    return 'CSRF doğrulaması başarısız (ct0). auth_token, ct0 ve twid aynı oturuma ait olmalı — üçünü de aynı anda kopyalayın.';
   }
   if (code === 326) {
-    return { error: 'Twitter hesabı geçici olarak kilitli. x.com\'a girip doğrulamayı tamamlayın, sonra çerezleri yeniden alın.' };
+    return 'Twitter hesabı geçici olarak kilitli. x.com\'a girip doğrulamayı tamamlayın, sonra çerezleri yeniden alın.';
   }
-  return { error: `Twitter doğrulaması başarısız (HTTP ${r.status}): ${twMsg}` };
+  if (code === 187) {
+    return 'Bu tweet birebir aynısı daha önce atıldığı için Twitter tarafından reddedildi (yinelenen içerik).';
+  }
+  if (code === 226) {
+    return 'Twitter bu gönderimi otomasyon şüphesiyle engelledi. Bir süre bekleyip tekrar deneyin.';
+  }
+  if (status === 429) {
+    return 'Twitter geçici hız sınırı uyguladı. Kısa bir süre sonra otomatik olarak tekrar denenecek.';
+  }
+  return `Twitter hatası (HTTP ${status}${code ? ', kod ' + code : ''}): ${fallback}`;
 }
 
-// auth_token + gerçek ct0 içeren, tweet atmaya hazır çerez listesi üretir.
-async function prepareTwitterCookies(cookies) {
+// Kayıtlı çerezlerden rettiwt API anahtarı üretir: base64("auth_token=..;ct0=..;twid=..;")
+// twid yoksa hesabı doğrulayıp kullanıcı kimliğinden türetiriz.
+async function buildRettiwtKey(cookies) {
   const jar = parseCookieMap(cookies);
   const authToken = jar.get('auth_token');
+  const ct0 = jar.get('ct0');
+
   if (!authToken) {
-    return { error: 'Çerezlerde auth_token yok. Twitter hesabını auth_token ile yeniden bağlayın.' };
+    return { error: 'Çerezlerde auth_token yok. Twitter hesabını yeniden bağlayın.' };
   }
-  if (!jar.get('ct0')) {
-    const ct0 = await fetchCt0(authToken);
-    if (!ct0) {
-      return { error: 'ct0 çerezi eksik ve otomatik alınamadı. Lütfen x.com çerezlerinden ct0 değerini de kopyalayıp hesabı yeniden bağlayın.' };
+  if (!ct0) {
+    return { error: 'Çerezlerde ct0 yok. x.com çerezlerinden ct0 değerini de kopyalayıp hesabı yeniden bağlayın.' };
+  }
+
+  let twid = normalizeTwid(jar.get('twid'));
+  let account = null;
+
+  if (!twid) {
+    const verified = await verifyTwitterCookies(jar);
+    if (verified.error) return { error: verified.error };
+    twid = twidFromUserId(verified.userId);
+    if (!twid) {
+      return { error: 'Kullanıcı kimliği (twid) belirlenemedi. Lütfen x.com çerezlerinden twid değerini de girin.' };
     }
-    jar.set('ct0', ct0);
+    account = verified;
   }
-  return { cookieStrings: toCookieStrings(jar), cookieMap: jar };
+
+  let cookieString = `auth_token=${authToken};ct0=${ct0};twid=${twid};`;
+  if (jar.get('kdt')) cookieString += `kdt=${jar.get('kdt')};`;
+
+  return { apiKey: Buffer.from(cookieString).toString('base64'), account, cookieMap: jar };
 }
 
+// ─── Medya Yükleme (parçalı) ────────────────────────────────────────────────
+// rettiwt'in kendi upload()'ı tüm dosyayı tek APPEND segmentinde gönderiyor;
+// X segment başına 5 MB kabul ettiği için videolar başarısız oluyordu. Burada
+// INIT → APPEND(xN) → FINALIZE akışını kendimiz yürütüp, video işlenmesini de
+// STATUS ile bekliyoruz (işlenmemiş medya tweet'e eklenirse gönderim reddedilir).
+const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const UPLOAD_URL = 'https://upload.x.com/i/media/upload.json';
+
+function mediaCategoryFor(mediaType) {
+  if (mediaType === 'image/gif') return 'tweet_gif';
+  if (mediaType.startsWith('video/')) return 'tweet_video';
+  return 'tweet_image';
+}
+
+async function uploadCall(cookieMap, params, body) {
+  const cookieHeader = [...cookieMap.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+  const headers = {
+    authorization: `Bearer ${TWITTER_BEARER}`,
+    cookie: cookieHeader,
+    'x-csrf-token': cookieMap.get('ct0') || '',
+    'x-twitter-auth-type': 'OAuth2Session',
+    'x-twitter-active-user': 'yes',
+    referer: 'https://x.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+  };
+  const r = await fetch(`${UPLOAD_URL}?${new URLSearchParams(params)}`, { method: 'POST', headers, body });
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch (_) {}
+  if (!r.ok) {
+    const code = data?.errors?.[0]?.code;
+    throw new Error(describeTwitterError(code, r.status, data?.errors?.[0]?.message || text.slice(0, 160)));
+  }
+  return data || {};
+}
+
+async function uploadMediaToTwitter(cookieMap, buffer, mediaType) {
+  const category = mediaCategoryFor(mediaType);
+
+  const init = await uploadCall(cookieMap, {
+    command: 'INIT',
+    total_bytes: String(buffer.length),
+    media_type: mediaType,
+    media_category: category,
+  });
+  const mediaId = init.media_id_string;
+  if (!mediaId) throw new Error('Medya yükleme başlatılamadı (media_id alınamadı).');
+
+  for (let offset = 0, seg = 0; offset < buffer.length; offset += UPLOAD_CHUNK_BYTES, seg++) {
+    const chunk = buffer.subarray(offset, Math.min(offset + UPLOAD_CHUNK_BYTES, buffer.length));
+    const form = new FormData();
+    form.append('media', new Blob([chunk]));
+    await uploadCall(cookieMap, { command: 'APPEND', media_id: mediaId, segment_index: String(seg) }, form);
+  }
+
+  const finalized = await uploadCall(cookieMap, { command: 'FINALIZE', media_id: mediaId });
+
+  // Videolar sunucu tarafında kodlanır; hazır olmadan tweet'e eklenemez.
+  let info = finalized.processing_info;
+  const deadline = Date.now() + 180000;
+  while (info && info.state !== 'succeeded') {
+    if (info.state === 'failed') {
+      throw new Error(`X medyayı işleyemedi: ${info.error?.message || 'bilinmeyen hata'}`);
+    }
+    if (Date.now() > deadline) throw new Error('Video işlenmesi zaman aşımına uğradı.');
+    await new Promise(r => setTimeout(r, Math.max(1000, (info.check_after_secs || 2) * 1000)));
+    const status = await uploadCall(cookieMap, { command: 'STATUS', media_id: mediaId });
+    info = status.processing_info;
+  }
+
+  return mediaId;
+}
+
+// Tek bir tweet'i (isteğe bağlı görsel/videolarla) gönderir.
 async function postTweetViaCookies(cookies, text, mediaData = []) {
+  const built = await buildRettiwtKey(cookies);
+  if (built.error) return { success: false, error: built.error };
+
   try {
-    const prepared = await prepareTwitterCookies(cookies);
-    if (prepared.error) return { success: false, error: prepared.error };
+    const rettiwt = new Rettiwt({ apiKey: built.apiKey, timeout: 120000, maxRetries: 2 });
 
-    const scraper = new Scraper();
-    await scraper.setCookies(prepared.cookieStrings);
-
-    // Kütüphane CreateTweet isteğine x-guest-token: auth.guestToken koyuyor ama
-    // setCookies sonrası bu alan hiç doldurulmuyor; "undefined" giden başlık
-    // Twitter tarafında error 32'ye yol açıyor. Burada gerçek bir token alıyoruz.
-    try {
-      await scraper.auth.updateGuestToken();
-    } catch (e) {
-      console.warn('[Twitter] guest token alınamadı:', e.message);
+    const media = [];
+    for (const item of mediaData.slice(0, 4)) { // X en fazla 4 medya kabul eder
+      const buf = Buffer.isBuffer(item.data) ? item.data : Buffer.from(item.data);
+      const id = await uploadMediaToTwitter(built.cookieMap, buf, item.mediaType);
+      media.push({ id });
+      console.log(`[Twitter] Medya yüklendi (${item.mediaType}, ${(buf.length / 1024).toFixed(0)} KB), id: ${id}`);
     }
 
-    const res = await scraper.sendTweet(text, undefined, mediaData.length ? mediaData : undefined);
+    const payload = {};
+    if (text) payload.text = text;
+    if (media.length) payload.media = media;
 
-    if (!res) {
-      return { success: false, error: 'Twitter yanıt vermedi.' };
+    const tweetId = await rettiwt.tweet.post(payload);
+    if (!tweetId) {
+      return { success: false, error: 'Twitter tweet kimliği döndürmedi; gönderim doğrulanamadı.' };
     }
 
-    let data = null;
-    try {
-      if (typeof res.json === 'function') {
-        data = await res.json();
-      } else {
-        data = res;
-      }
-    } catch (_) {
-      data = res;
-    }
-
-    if (data?.errors && data.errors.length > 0) {
-      const errMsg = data.errors[0]?.message || JSON.stringify(data.errors);
-      console.error('[Twitter] Cookie tweet hatası:', errMsg);
-      return { success: false, error: errMsg };
-    }
-
-    const tweetId = data?.data?.create_tweet?.tweet_results?.result?.rest_id || data?.id;
-    console.log('[Twitter] Cookie tweet başarılı! Tweet ID:', tweetId || 'ok');
-    return { success: true, tweetId: tweetId || null };
+    console.log('[Twitter] Tweet gönderildi! ID:', tweetId);
+    return { success: true, tweetId };
   } catch (err) {
-    const raw = err.message || String(err);
-    console.error('[Twitter] Cookie tweet istisna:', raw);
-    let msg = raw;
-    if (raw.includes('"code":32') || raw.includes('Could not authenticate you')) {
-      msg = 'Twitter oturumu kabul etmedi (Hata 32). auth_token veya ct0 geçersiz/eskimiş. x.com\'da oturum açıp iki değeri de yeniden kopyalayın ve hesabı tekrar bağlayın.';
-    } else if (raw.includes('"code":353') || raw.includes('"code":403') || raw.includes('csrf')) {
-      msg = 'CSRF (ct0) doğrulaması başarısız. Lütfen x.com çerezlerinden ct0 değerini de girip hesabı yeniden bağlayın.';
-    } else if (raw.includes('"code":326') || raw.includes('locked')) {
-      msg = 'Twitter hesabı geçici olarak kilitlenmiş. x.com\'a girip doğrulamayı tamamlayın.';
-    }
-    return { success: false, error: msg };
+    const raw = err?.message || String(err);
+    console.error('[Twitter] Tweet gönderim hatası:', raw);
+    // Twitter'ın kendi hata kodu ile HTTP durum kodunu karıştırmamak için ayrı ayrı ayrıştırıyoruz.
+    const code = Number(/"code"\s*:\s*(\d+)/.exec(raw)?.[1] ?? err?.response?.data?.errors?.[0]?.code) || undefined;
+    const status = Number(/status code (\d{3})/i.exec(raw)?.[1] ?? err?.response?.status) || undefined;
+    return { success: false, error: describeTwitterError(code, status, raw.slice(0, 200)) };
   }
 }
 
@@ -748,8 +808,11 @@ function buildTweetText(rawText, rule) {
 }
 
 // ─── Telegram Media → Twitter Media ─────────────────────────────────────────
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;   // Twitter görsel limiti
-const MAX_VIDEO_BYTES = 512 * 1024 * 1024; // Twitter video limiti
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;  // X'in görsel limiti
+// X 512 MB'a kadar video kabul ediyor, ancak medya belleğe indiriliyor ve Render
+// ücretsiz sürümü 512 MB RAM veriyor. 64 MB pratikte Telegram videolarını karşılar
+// ve sunucunun belleğini taşırmaz.
+const MAX_VIDEO_BYTES = 64 * 1024 * 1024;
 
 async function extractTelegramMedia(msg) {
   try {
