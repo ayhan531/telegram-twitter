@@ -15,6 +15,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
 
   // ── Twitter Token / API Keys State ──
   const [authToken,         setAuthToken]         = useState('');
+  const [ctToken,           setCtToken]           = useState('');
   const [cookieJson,        setCookieJson]        = useState('');
   const [consumerKey,       setConsumerKey]       = useState('');
   const [consumerSecret,    setConsumerSecret]    = useState('');
@@ -77,9 +78,13 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
         setTimeout(() => setActiveModal(null), 1200);
 
       } else if (twTab === 'auth_token' || twTab === 'cookie_json') {
+        const cookiesArray = [];
+        if (authToken.trim()) cookiesArray.push(`auth_token=${authToken.trim()}`);
+        if (ctToken.trim()) cookiesArray.push(`ct0=${ctToken.trim()}`);
+
         const payload = twTab === 'cookie_json'
           ? { cookieJson: cookieJson.trim() }
-          : { cookies: [`auth_token=${authToken.trim()}`], authToken: authToken.trim() };
+          : { cookies: cookiesArray, authToken: authToken.trim(), ct0: ctToken.trim() };
 
         if (twTab === 'auth_token' && !authToken.trim()) {
           throw new Error('Lütfen x.com hesabınızdan aldığınız auth_token değerini girin.');
@@ -105,7 +110,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           status: 'connected',
           avatarColor: 'bg-neutral-800',
           credentials: {
-            cookies: data.cookies,
+            cookies: data.cookies || cookiesArray,
             authToken: authToken.trim() || null,
           },
         };
@@ -553,13 +558,26 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
 
                 <div>
                   <label className="text-[11px] font-bold text-slate-300 block mb-1">
-                    auth_token Değeri
+                    1. auth_token Değeri
                   </label>
                   <input
                     type="text"
                     value={authToken}
                     onChange={e => setAuthToken(e.target.value)}
-                    placeholder="Örn: 6a7f8e9d0c1b2a3f..."
+                    placeholder="1cccdb429a6cb3f0f289469d1eccafbf77ed087d"
+                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
+                    2. ct0 Değeri (auth_token'ın Hemen Altındaki Satır)
+                  </label>
+                  <input
+                    type="text"
+                    value={ctToken}
+                    onChange={e => setCtToken(e.target.value)}
+                    placeholder="92b3367cba18ca166ac14c1af0b7c2f2d3596fc45bc56..."
                     className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
                   />
                 </div>
