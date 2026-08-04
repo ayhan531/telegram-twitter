@@ -740,7 +740,16 @@ async function uploadMediaToTwitter(cookieMap, buffer, mediaType) {
 }
 
 // ─── Tweet Gönderimi ────────────────────────────────────────────────────────
-async function createTweetRequest(cookieMap, op, text, mediaIds) {
+// Tweet'e kimlerin yanıt verebileceği. "everyone" X'in varsayılanıdır ve
+// istekte hiç alan gönderilmemesi gerekir.
+const REPLY_MODES = {
+  everyone:  null,
+  following: 'Community',    // Takip ettiğin hesaplar
+  mentioned: 'ByInvitation', // Yalnızca bahsettiğin hesaplar
+  verified:  'Verified',     // Onaylanmış hesaplar
+};
+
+async function createTweetRequest(cookieMap, op, text, mediaIds, replyMode = 'everyone') {
   const pathname = `/i/api/graphql/${op.queryId}/CreateTweet`;
   const txId = await clientTransactionId('POST', pathname);
   const variables = {
@@ -753,6 +762,9 @@ async function createTweetRequest(cookieMap, op, text, mediaIds) {
     semantic_annotation_ids: [],
     disallowed_reply_options: null,
   };
+
+  const controlMode = REPLY_MODES[replyMode];
+  if (controlMode) variables.conversation_control = { mode: controlMode };
 
   const r = await fetch(`https://x.com${pathname}`, {
     method: 'POST',
@@ -806,20 +818,20 @@ function enqueueSend(task) {
   return queued;
 }
 
-async function attemptCreateTweet(cookieMap, text, mediaIds) {
+async function attemptCreateTweet(cookieMap, text, mediaIds, replyMode) {
   let op = await discoverCreateTweetOp(cookieMap);
-  let res = await createTweetRequest(cookieMap, op, text, mediaIds);
+  let res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode);
 
   // Sorgu kimliği eskimişse X 404 döner; kimliği tazeleyip bir kez daha deniyoruz.
   if (res.status === 404) {
     console.warn('[Twitter] Sorgu kimliği eskimiş, yeniden keşfediliyor...');
     op = await discoverCreateTweetOp(cookieMap, true);
-    res = await createTweetRequest(cookieMap, op, text, mediaIds);
+    res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode);
   }
   return res;
 }
 
-async function postTweetViaCookies(cookies, text, mediaData = []) {
+async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'everyone') {
   const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
   if (!cookieMap.get('auth_token') || !cookieMap.get('ct0')) {
     return { success: false, error: 'Çerezler eksik (auth_token ve ct0 gerekli). Hesabı yeniden bağlayın.' };
@@ -840,7 +852,7 @@ async function postTweetViaCookies(cookies, text, mediaData = []) {
       }
 
       for (let attempt = 0; ; attempt++) {
-        const res = await attemptCreateTweet(cookieMap, text, mediaIds);
+        const res = await attemptCreateTweet(cookieMap, text, mediaIds, replyMode);
 
         const tweetId = res.data?.data?.create_tweet?.tweet_results?.result?.rest_id;
         if (tweetId) {
@@ -989,7 +1001,7 @@ app.post('/api/sync/test', async (req, res) => {
     try {
       if (Array.isArray(c.cookies) && c.cookies.length > 0) {
         // Free & Unlimited Cookie Mode
-        const freeRes = await postTweetViaCookies(c.cookies, formattedText);
+        const freeRes = await postTweetViaCookies(c.cookies, formattedText, [], rule.replyMode);
         results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
       } else if (c.consumerKey && c.consumerSecret) {
         // Official API Key Mode
@@ -1093,6 +1105,73 @@ async function extractTelegramMedia(msg) {
   }
 }
 
+// ─── Kanal / Gönderen Filtreleri ────────────────────────────────────────────
+// Kullanıcı kanal veya kişi kimliğini çok farklı biçimlerde girebiliyor:
+// -1001234567890, 1234567890, @kanaladi, kanaladi, https://t.me/kanaladi ...
+// Eskiden çözümlenemeyen bir değer boş stringe düşüyor ve "filtre yok" sayılıp
+// TÜM mesajları geçiriyordu; artık anlaşılmayan filtre hiçbir şeyi eşleştirmez.
+function parseTargetFilter(raw) {
+  const s = (raw || '').trim();
+  if (!s) return { type: 'all' };
+
+  // Özel kanal linki: t.me/c/<kanal kimliği>/<mesaj no>
+  const privateLink = /(?:t\.me|telegram\.me)\/c\/(\d+)/i.exec(s);
+  if (privateLink) return { type: 'id', value: privateLink[1] };
+
+  const link = /(?:t\.me|telegram\.me)\/(?:s\/)?@?([A-Za-z0-9_]+)/i.exec(s);
+  if (link) {
+    return /^\d+$/.test(link[1])
+      ? { type: 'id', value: link[1] }
+      : { type: 'username', value: link[1].toLowerCase() };
+  }
+
+  if (s.startsWith('@')) {
+    const handle = s.slice(1).trim().toLowerCase();
+    return handle ? { type: 'username', value: handle } : { type: 'invalid', value: s };
+  }
+
+  // -100 öneki, MTProto kanal kimliğinin dışa dönük gösterimidir.
+  const digits = s.replace(/^-100/, '').replace(/^-/, '');
+  if (/^\d+$/.test(digits)) return { type: 'id', value: digits };
+
+  if (/^[A-Za-z0-9_]{4,}$/.test(s)) return { type: 'username', value: s.toLowerCase() };
+
+  return { type: 'invalid', value: s };
+}
+
+const warnedFilters = new Set();
+
+function matchesTarget(filter, id, username, label) {
+  if (filter.type === 'all') return true;
+
+  if (filter.type === 'invalid') {
+    if (!warnedFilters.has(label + filter.value)) {
+      warnedFilters.add(label + filter.value);
+      console.error(`[Telegram] ${label} anlaşılamadı: "${filter.value}". @kullaniciadi veya -100... kimliği girin. Bu kural hiçbir mesajı geçirmeyecek.`);
+    }
+    return false;
+  }
+
+  if (filter.type === 'id') return !!id && String(id) === filter.value;
+  return !!username && username === filter.value;
+}
+
+// Gönderen kimliği/kullanıcı adı. Kanallarda gönderi kanalın kendisine aittir;
+// gruplarda gerçek kullanıcıya. İkisini de destekliyoruz.
+async function messageSenderInfo(msg) {
+  const senderId = msg.senderId?.toString() ||
+                   msg.fromId?.userId?.toString() ||
+                   msg.fromId?.channelId?.toString() || null;
+  let username = null;
+  try {
+    const s = await msg.getSender();
+    username = (s?.username || '').toLowerCase() || null;
+  } catch (e) {
+    console.warn('[Telegram] Gönderen bilgisi alınamadı:', e.message);
+  }
+  return { senderId, username };
+}
+
 // ─── Telegram Listener Engine ───────────────────────────────────────────────
 async function startTelegramListener(accountId) {
   const sess = tgActiveSessions.get(accountId);
@@ -1165,23 +1244,29 @@ async function startTelegramListener(accountId) {
         return;
       }
 
+      const channelFilters = accountRules.map(r => parseTargetFilter(r.sourceChannelId));
+      const senderFilters  = accountRules.map(r => parseTargetFilter(r.sourceSenderId));
+
+      // Kullanıcı adına göre eşleşme istenmişse kanal/gönderen bilgisini çekiyoruz.
       let chatUsername = null;
-      if (accountRules.some(r => r.sourceChannelId?.trim().startsWith('@'))) {
+      if (channelFilters.some(f => f.type === 'username')) {
         try {
           const chat = await msg.getChat();
-          chatUsername = (chat?.username || '').toLowerCase();
-        } catch (_) {}
+          chatUsername = (chat?.username || '').toLowerCase() || null;
+        } catch (e) {
+          console.warn('[Telegram] Kanal bilgisi alınamadı:', e.message);
+        }
       }
 
-      const matchingRules = accountRules.filter(rule => {
-        const rawFilter = rule.sourceChannelId?.trim();
-        if (rawFilter) {
-          if (rawFilter.startsWith('@')) {
-            if (rawFilter.slice(1).toLowerCase() !== chatUsername) return false;
-          } else {
-            const ruleChannelId = rawFilter.replace(/^-100/, '').replace(/^-/, '').replace(/[^0-9]/g, '');
-            if (ruleChannelId && chatId !== ruleChannelId) return false;
-          }
+      let sender = null;
+      if (senderFilters.some(f => f.type !== 'all')) {
+        sender = await messageSenderInfo(msg);
+      }
+
+      const matchingRules = accountRules.filter((rule, i) => {
+        if (!matchesTarget(channelFilters[i], chatId, chatUsername, `${rule.title} kanal filtresi`)) return false;
+        if (senderFilters[i].type !== 'all') {
+          if (!matchesTarget(senderFilters[i], sender?.senderId, sender?.username, `${rule.title} gönderen filtresi`)) return false;
         }
         return true;
       });
@@ -1251,7 +1336,7 @@ async function executeSyncRule(rule, message, twitterAccounts) {
     try {
       if (Array.isArray(c.cookies) && c.cookies.length > 0) {
         // Free & Unlimited Cookie Mode (görsel/video dahil)
-        const freeRes = await postTweetViaCookies(c.cookies, text, media);
+        const freeRes = await postTweetViaCookies(c.cookies, text, media, rule.replyMode);
         results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
       } else if (c.consumerKey && c.consumerSecret) {
         // Official API Key Mode (yalnızca metin; medya çerez modunda destekleniyor)

@@ -12,6 +12,8 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
     title: 'Oto-Tweet Kuralı',
     sourceAccountId: telegramAccounts[0]?.credentials?.accountId || telegramAccounts[0]?.id || '',
     sourceChannelId: '', // @kanaladi, -100... or empty for all
+    sourceSenderId: '',  // @kullaniciadi veya kimlik; boş = kanaldaki herkes
+    replyMode: 'everyone',
     targetIds: twitterAccounts.map(a => a.id),
     autoHashtags: '',
     bannedKeywords: '',
@@ -77,6 +79,30 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
         <input type="text" value={form.sourceChannelId} onChange={e => set('sourceChannelId', e.target.value)}
           placeholder="@kanaladi veya -1001234567890 (Boş = Tüm mesajlar)"
           className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">👤 Yalnızca Bu Kişinin Mesajları (İsteğe Bağlı)</label>
+        <p className="text-[10px] text-slate-400 mb-1.5">
+          Kullanıcı adı (örn: <code className="text-sky-400">@ahmet</code>) veya sayısal kimlik.
+          <strong> Boş bırakırsan kanaldaki herkesin mesajı tweet atılır.</strong> Kanallarda
+          gönderiler kanalın kendisine ait olduğu için bu alan asıl gruplarda işe yarar.
+        </p>
+        <input type="text" value={form.sourceSenderId} onChange={e => set('sourceSenderId', e.target.value)}
+          placeholder="@kullaniciadi (Boş = Herkes)"
+          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">💬 Tweet'e Kimler Yanıt Verebilir?</label>
+        <p className="text-[10px] text-slate-400 mb-1.5">X'te tweet atarken seçtiğin ayarın aynısı, otomatik uygulanır.</p>
+        <select value={form.replyMode} onChange={e => set('replyMode', e.target.value)}
+          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs bg-slate-800 border border-slate-700">
+          <option value="everyone">🌍 Herkes</option>
+          <option value="following">👥 Takip ettiğin hesaplar</option>
+          <option value="mentioned">📣 Yalnızca bahsettiğin hesaplar</option>
+          <option value="verified">✅ Onaylanmış hesaplar</option>
+        </select>
       </div>
 
       <div>
@@ -283,6 +309,9 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
                       <div>
                         <p className="text-[11px] font-semibold text-sky-300">Telegram</p>
                         <p className="text-[9px] text-slate-400 font-mono">{rule.sourceChannelId || 'Tüm Mesajlar'}</p>
+                        {rule.sourceSenderId && (
+                          <p className="text-[9px] text-amber-300/80 font-mono">👤 {rule.sourceSenderId}</p>
+                        )}
                       </div>
                     </div>
 
@@ -290,7 +319,16 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
 
                     <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-indigo-900/30 border border-indigo-500/20">
                       <span className="text-sm">𝕏</span>
-                      <span className="text-[11px] text-indigo-300 font-semibold">Twitter</span>
+                      <div>
+                        <p className="text-[11px] text-indigo-300 font-semibold">Twitter</p>
+                        <p className="text-[9px] text-slate-400">
+                          {{
+                            following: '👥 Takip ettiklerin yanıtlar',
+                            mentioned: '📣 Bahsettiklerin yanıtlar',
+                            verified:  '✅ Onaylılar yanıtlar',
+                          }[rule.replyMode] || '🌍 Herkes yanıtlar'}
+                        </p>
+                      </div>
                     </div>
                   </div>
 
