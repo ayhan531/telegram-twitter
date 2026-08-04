@@ -242,13 +242,28 @@ app.post('/api/telegram/session/store', (req, res) => {
   const { accountId, accountName, sessionString, apiId, apiHash } = req.body;
   if (!accountId || !sessionString) return res.status(400).json({ success: false, error: 'accountId ve sessionString gerekli.' });
   const existing = tgActiveSessions.get(accountId);
+
+  // Oturum dizesi değiştiyse eski istemci artık eski hesaba bağlıdır; onu
+  // kapatmazsak yeni oturum hiç kullanılmaz ve dinleyici eskisinde takılı kalır.
+  const sessionChanged = existing && existing.sessionString !== sessionString;
+  if (sessionChanged && existing.client) {
+    existing.client.disconnect().catch(() => {});
+    console.log(`[Telegram] Oturum değişti, eski dinleyici kapatıldı: ${accountId}`);
+  }
+
   tgActiveSessions.set(accountId, {
     accountId, accountName, sessionString,
     apiId: apiId || '2040',
     apiHash: apiHash || 'b18441a1ed607e10e4b39251a1319a14',
-    client: existing?.client || null
+    client: sessionChanged ? null : (existing?.client || null),
+    authExpired: false,
   });
   saveState();
+
+  // Yeni oturumda dinleyiciyi hemen başlat; kullanıcı ayrıca tetiklemek zorunda kalmasın.
+  startTelegramListener(accountId).catch(e =>
+    console.error('[Telegram] Dinleyici otomatik başlatılamadı:', e.message));
+
   return res.json({ success: true, message: 'Oturum sunucuya kaydedildi.' });
 });
 
@@ -1081,7 +1096,8 @@ async function extractTelegramMedia(msg) {
 // ─── Telegram Listener Engine ───────────────────────────────────────────────
 async function startTelegramListener(accountId) {
   const sess = tgActiveSessions.get(accountId);
-  if (!sess || sess.client) return; // already active
+  if (!sess || sess.client) return;   // zaten çalışıyor
+  if (sess.authExpired) return;       // oturum ölü; yeniden bağlanana kadar deneme
 
   try {
     const { TelegramClient } = await import('teleproto');
@@ -1096,7 +1112,28 @@ async function startTelegramListener(accountId) {
     );
 
     await client.connect();
+
+    // Oturum sonlandırılmışsa bağlantı yine kurulur ama her senkron denemesi
+    // AuthKeyUnregisteredError ile döner ve log sonsuza kadar hatayla dolar.
+    // Böyle bir oturumu tutmak yerine kapatıp kullanıcıya bildiriyoruz.
+    const authorized = await client.isUserAuthorized().catch(() => false);
+    if (!authorized) {
+      await client.disconnect().catch(() => {});
+      sess.client = null;
+      sess.authExpired = true;
+      console.error(`[Telegram] Oturum geçersiz (${accountId} / ${sess.accountName}). Yeniden QR ile bağlanılmalı.`);
+      pushSyncLog({
+        source: `Telegram → ${sess.accountName || accountId}`,
+        messagePreview: 'Telegram oturumu geçersiz',
+        targets: [],
+        status: 'error',
+        details: 'Bu Telegram hesabının oturumu sonlandırılmış. Hesabı QR ile yeniden bağlayın.',
+      });
+      return;
+    }
+
     sess.client = client;
+    sess.authExpired = false;
     console.log(`[Telegram] Dinleyici başlatıldı: ${accountId} (${sess.accountName})`);
 
     client.addEventHandler(async (event) => {
