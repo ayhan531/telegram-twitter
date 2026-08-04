@@ -1054,8 +1054,16 @@ async function extractTelegramMedia(msg) {
     if (!mediaType) return [];
 
     console.log(`[Media] Telegram medyası indiriliyor (${mediaType})...`);
-    const buf = await msg.downloadMedia();
-    if (!buf || !buf.length) return [];
+    // İndirme askıda kalırsa tüm kuyruk kilitlenir; bu yüzden süre sınırı koyuyoruz.
+    const buf = await Promise.race([
+      msg.downloadMedia(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('indirme 3 dakikada tamamlanmadı')), 180000)),
+    ]);
+    if (!buf || !buf.length) {
+      console.warn('[Media] Medya boş geldi, metin olarak devam ediliyor.');
+      return [];
+    }
 
     const limit = mediaType.startsWith('image/') ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES;
     if (buf.length > limit) {
@@ -1078,6 +1086,7 @@ async function startTelegramListener(accountId) {
   try {
     const { TelegramClient } = await import('teleproto');
     const { StringSession } = await import('teleproto/sessions/index.js');
+    const { NewMessage } = await import('teleproto/events/index.js');
 
     const client = new TelegramClient(
       new StringSession(sess.sessionString),
@@ -1094,22 +1103,30 @@ async function startTelegramListener(accountId) {
       const msg = event.message;
       if (!msg) return;
 
-      const msgKey = `${accountId}:${msg.id}`;
-      if (recentlySynced.has(msgKey)) return;
-      recentlySynced.add(msgKey);
-      setTimeout(() => recentlySynced.delete(msgKey), 60000);
-
       const chatId = msg.peerId?.channelId?.toString() ||
                      msg.peerId?.chatId?.toString() ||
                      msg.peerId?.userId?.toString() || '';
-      const senderId = msg.fromId?.userId?.toString() || '';
 
-      const rawText = msg.text || msg.caption || '';
+      // Mesaj numaraları kanal bazında artar; anahtara kanalı da katmazsak
+      // farklı kanallardaki aynı numaralı mesajlar birbirini eler.
+      const msgKey = `${accountId}:${chatId}:${msg.id}`;
+      if (recentlySynced.has(msgKey)) return;
+      recentlySynced.add(msgKey);
+      setTimeout(() => recentlySynced.delete(msgKey), 60000);
+      // MTProto'da medya açıklaması da .message alanındadır; Bot API'deki
+      // "caption" burada yoktur. .text getter'ı istemci bağlı değilse boş döner,
+      // bu yüzden ham .message alanına da düşüyoruz.
+      const rawText = msg.text || msg.message || '';
       console.log(`[Telegram] Yeni mesaj geldi (Chat: ${chatId}): ${rawText.slice(0, 60)}`);
 
       const accountRules = [...syncRulesStore.values()].filter(
         r => r.enabled && r.sourceAccountId === accountId
       );
+
+      if (!accountRules.length) {
+        console.log('[Telegram] Bu hesap için etkin kural yok, mesaj atlandı.');
+        return;
+      }
 
       let chatUsername = null;
       if (accountRules.some(r => r.sourceChannelId?.trim().startsWith('@'))) {
@@ -1132,10 +1149,16 @@ async function startTelegramListener(accountId) {
         return true;
       });
 
+      if (!matchingRules.length) {
+        console.log(`[Telegram] Chat ${chatId} hiçbir kuralın kanal filtresine uymadı, atlandı.`);
+        return;
+      }
+
+      console.log(`[Telegram] ${matchingRules.length} kural eşleşti, tweet gönderiliyor...`);
       for (const rule of matchingRules) {
         await executeSyncRule(rule, msg, rule.targetAccounts || []);
       }
-    });
+    }, new NewMessage({}));
 
   } catch (err) {
     console.error(`[Telegram] Dinleyici başlatma hatası (${accountId}):`, err.message);
