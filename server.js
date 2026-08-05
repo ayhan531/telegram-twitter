@@ -150,12 +150,57 @@ app.get('/api/config', async (_req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 //  TELEGRAM ─ QR LOGIN & SESSION MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════
+// Kullanıcı 2FA şifresini girene kadar bekleyeceğimiz süre. Bunu sınırsız
+// bırakırsak QR oturumu ve açık MTProto bağlantısı sonsuza dek asılı kalır.
+const QR_PASSWORD_WAIT_MS = 5 * 60 * 1000;
+const QR_SESSION_TTL_MS   = 15 * 60 * 1000;
+
+// teleproto, `password`/`onError` geri çağrımlarımız hata fırlattığında ham
+// hatayı yutup yerine "AUTH_USER_CANCEL" fırlatıyor. Kullanıcıya bunu
+// göstermek anlamsız; gerçek sebebi koruyup okunur bir metne çeviriyoruz.
+function readableQRError(raw, existing) {
+  if (existing) return existing;
+  const msg = raw || 'Bilinmeyen hata';
+  if (msg === 'AUTH_USER_CANCEL') return 'Telegram girişi tamamlanamadı. Lütfen QR kodu yeniden oluşturup tekrar deneyin.';
+  if (msg.includes('QR login aborted')) return 'QR oturumu iptal edildi.';
+  return msg;
+}
+
+function releaseQRSession(sessionData) {
+  if (sessionData.passwordTimer) {
+    clearTimeout(sessionData.passwordTimer);
+    sessionData.passwordTimer = null;
+  }
+  sessionData.passwordResolve = null;
+  sessionData.passwordReject = null;
+  if (sessionData.client) {
+    const client = sessionData.client;
+    sessionData.client = null;
+    client.disconnect().catch(() => {});
+  }
+}
+
+// Yarım kalan QR oturumları (kullanıcı pencereyi kapattı, taramadı vs.) aksi
+// hâlde MTProto bağlantısını açık tutar ve bellekte birikir.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of tgQRSessions) {
+    if (now - (s.createdAt || 0) < QR_SESSION_TTL_MS) continue;
+    releaseQRSession(s);
+    tgQRSessions.delete(id);
+  }
+}, 5 * 60 * 1000).unref?.();
+
 app.post('/api/telegram/qr/start', async (req, res) => {
   const apiId   = process.env.TELEGRAM_API_ID   || req.body.apiId   || '2040';
   const apiHash = process.env.TELEGRAM_API_HASH || req.body.apiHash || 'b18441a1ed607e10e4b39251a1319a14';
 
   const sessionId = crypto.randomBytes(16).toString('hex');
-  const sessionData = { status: 'starting', qrDataUrl: null, sessionString: null, user: null, error: null };
+  const sessionData = {
+    status: 'starting', qrDataUrl: null, sessionString: null, user: null, error: null,
+    createdAt: Date.now(), passwordHint: '', passwordError: null,
+    passwordResolve: null, passwordReject: null, passwordTimer: null, client: null,
+  };
   tgQRSessions.set(sessionId, sessionData);
 
   try {
@@ -185,17 +230,43 @@ app.post('/api/telegram/qr/start', async (req, res) => {
             sessionData.status = 'error';
           }
         },
-        password: async () => {
-          throw new Error('İki adımlı doğrulama (2FA) aktif. Lütfen Telegram Ayarlar > İki Adımlı Doğrulama\'yı kapatıp tekrar deneyin.');
+        // Hesapta iki adımlı doğrulama varsa QR taraması başarılı olur ama
+        // Telegram bulut şifresini ister. Burada hata fırlatmak yerine
+        // arayüzden şifreyi isteyip bekliyoruz.
+        password: async (hint) => {
+          sessionData.passwordHint = hint || '';
+          sessionData.status = 'awaiting_password';
+          return await new Promise((resolve, reject) => {
+            sessionData.passwordResolve = resolve;
+            sessionData.passwordReject = reject;
+            sessionData.passwordTimer = setTimeout(() => {
+              sessionData.passwordResolve = null;
+              sessionData.passwordReject = null;
+              sessionData.error = 'İki adımlı doğrulama şifresi zamanında girilmedi. Lütfen tekrar deneyin.';
+              sessionData.status = 'error';
+              reject(new Error(sessionData.error));
+            }, QR_PASSWORD_WAIT_MS);
+          });
         },
         onError: async (err) => {
-          sessionData.error = err.message;
+          const msg = err?.errorMessage || err?.message || '';
+          // Yanlış şifre ölümcül değil: akışı sonlandırmak yerine kullanıcıya
+          // tekrar sorduruyoruz (false döndürmek teleproto'ya "devam et" der).
+          if (msg.includes('PASSWORD_HASH_INVALID') || msg === 'Password is empty') {
+            // Durumu burada 'awaiting_password' yapmıyoruz: teleproto şifreyi
+            // yeniden isteyene kadar bekleyen bir promise yok, arayüz erken
+            // gönderirse kaybolurdu. Bunu password geri çağrımı üstleniyor.
+            sessionData.passwordError = 'Şifre hatalı. Lütfen tekrar deneyin.';
+            return false;
+          }
+          sessionData.error = readableQRError(msg, sessionData.error);
           sessionData.status = 'error';
           return true;
         },
       }
     ).then(async (user) => {
       sessionData.sessionString = client.session.save();
+      sessionData.passwordError = null;
       sessionData.status = 'authorized';
       sessionData.user = {
         id: user.id.toString(),
@@ -204,11 +275,17 @@ app.post('/api/telegram/qr/start', async (req, res) => {
         username: user.username || '',
         phone: user.phone || '',
       };
+      // Oturum dizesi kaydedildi; geçici istemciyi açık tutmaya gerek yok.
+      // Dinleyici kendi bağlantısını kuruyor.
+      releaseQRSession(sessionData);
     }).catch((err) => {
       if (sessionData.status !== 'authorized') {
-        sessionData.error = err.message;
+        // Daha açıklayıcı bir mesajı zaten yakalamışsak onu ezmiyoruz;
+        // aksi hâlde kullanıcı "AUTH_USER_CANCEL" görüyordu.
+        sessionData.error = readableQRError(err?.message, sessionData.error);
         sessionData.status = 'error';
       }
+      releaseQRSession(sessionData);
     });
 
     for (let i = 0; i < 40; i++) {
@@ -235,7 +312,31 @@ app.get('/api/telegram/qr/poll', (req, res) => {
     sessionString: s.status === 'authorized' ? s.sessionString : null,
     user: s.user,
     error: s.error,
+    passwordHint: s.passwordHint || '',
+    passwordError: s.passwordError || null,
   });
+});
+
+// İki adımlı doğrulama (2FA) şifresi: QR taraması başarılı olduğunda Telegram
+// bulut şifresini ister, bunu arayüzden alıp bekleyen akışa iletiyoruz.
+app.post('/api/telegram/qr/password', (req, res) => {
+  const { sessionId, password } = req.body || {};
+  const s = tgQRSessions.get(sessionId);
+  if (!s) return res.status(404).json({ success: false, error: 'Oturum bulunamadı. QR kodu yeniden oluşturun.' });
+  if (!password) return res.status(400).json({ success: false, error: 'Şifre boş olamaz.' });
+  if (!s.passwordResolve) {
+    return res.status(409).json({ success: false, error: 'Şu anda şifre beklenmiyor. QR kodu yeniden oluşturun.' });
+  }
+
+  const resolve = s.passwordResolve;
+  s.passwordResolve = null;
+  s.passwordReject = null;
+  clearTimeout(s.passwordTimer);
+  s.passwordTimer = null;
+  s.passwordError = null;
+  s.status = 'verifying_password';
+  resolve(password);
+  return res.json({ success: true });
 });
 
 app.post('/api/telegram/session/store', (req, res) => {

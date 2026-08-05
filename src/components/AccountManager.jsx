@@ -32,6 +32,10 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const [sessionId,   setSessionId]   = useState('');
   const [tgError,     setTgError]     = useState('');
   const [tgUser,      setTgUser]      = useState(null);
+  const [tgPassword,  setTgPassword]  = useState('');
+  const [tgPwHint,    setTgPwHint]    = useState('');
+  const [tgPwError,   setTgPwError]   = useState('');
+  const [tgPwSending, setTgPwSending] = useState(false);
   const pollRef = useRef(null);
 
   useEffect(() => {
@@ -173,6 +177,9 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const startTelegramQR = async () => {
     setTgStep('loading');
     setTgError('');
+    setTgPassword('');
+    setTgPwHint('');
+    setTgPwError('');
     try {
       const res = await fetch('/api/telegram/qr/start', {
         method: 'POST',
@@ -199,6 +206,15 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
         const res = await fetch(`/api/telegram/qr/poll?sessionId=${sid}`);
         const data = await res.json();
         if (data.qrDataUrl) setQrDataUrl(data.qrDataUrl);
+
+        // QR tarandı ama hesapta iki adımlı doğrulama var: şifre ekranına geç.
+        if (data.status === 'awaiting_password') {
+          setTgPwHint(data.passwordHint || '');
+          setTgPwError(data.passwordError || '');
+          setTgPwSending(false);
+          setTgStep('password');
+        }
+
         if (data.status === 'authorized') {
           clearInterval(pollRef.current);
           setTgUser(data.user);
@@ -248,6 +264,26 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
         }
       } catch (_) {}
     }, 2000);
+  };
+
+  const submitTelegramPassword = async () => {
+    if (!tgPassword.trim() || tgPwSending) return;
+    setTgPwSending(true);
+    setTgPwError('');
+    try {
+      const res = await fetch('/api/telegram/qr/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, password: tgPassword }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error);
+      setTgPassword('');
+      // Sonuç (başarı ya da "şifre hatalı") mevcut poll döngüsünden gelecek.
+    } catch (err) {
+      setTgPwError(err.message);
+      setTgPwSending(false);
+    }
   };
 
   const removeAccount = (id) => {
@@ -392,7 +428,10 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
               <h3 className="font-bold text-white text-base flex items-center space-x-2">
                 <span>✈️ Telegram Bağlantısı (QR Code)</span>
               </h3>
-              <button onClick={() => setActiveModal(null)} className="text-slate-400 hover:text-white text-sm font-bold">✕</button>
+              <button
+                onClick={() => { clearInterval(pollRef.current); setActiveModal(null); }}
+                className="text-slate-400 hover:text-white text-sm font-bold"
+              >✕</button>
             </div>
 
             {tgStep === 'loading' && (
@@ -420,6 +459,50 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
                 <div className="flex items-center space-x-2 text-xs text-amber-400 animate-pulse">
                   <Loader2 size={13} className="animate-spin" /><span>Taranması bekleniyor...</span>
                 </div>
+              </div>
+            )}
+
+            {tgStep === 'password' && (
+              <div className="space-y-4">
+                <div className="p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-xs text-emerald-300 flex items-start space-x-2">
+                  <CheckCircle2 size={14} className="mt-0.5 shrink-0" />
+                  <span>QR kodu okundu. Hesabında iki adımlı doğrulama açık, devam etmek için Telegram bulut şifreni gir.</span>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-300">Telegram Bulut Şifresi (2FA)</label>
+                  <input
+                    type="password"
+                    autoFocus
+                    value={tgPassword}
+                    onChange={e => setTgPassword(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') submitTelegramPassword(); }}
+                    placeholder="••••••••"
+                    className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:border-sky-500 outline-none"
+                  />
+                  {tgPwHint && (
+                    <p className="text-[11px] text-slate-400">İpucu: {tgPwHint}</p>
+                  )}
+                  <p className="text-[11px] text-slate-500">
+                    Bu şifre yalnızca Telegram'a iletilir, hiçbir yere kaydedilmez.
+                  </p>
+                </div>
+
+                {tgPwError && (
+                  <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300">
+                    {tgPwError}
+                  </div>
+                )}
+
+                <button
+                  onClick={submitTelegramPassword}
+                  disabled={tgPwSending || !tgPassword.trim()}
+                  className="w-full py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center justify-center space-x-2"
+                >
+                  {tgPwSending
+                    ? <><Loader2 size={14} className="animate-spin" /><span>Doğrulanıyor...</span></>
+                    : <span>Doğrula ve Bağlan</span>}
+                </button>
               </div>
             )}
 
