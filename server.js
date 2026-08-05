@@ -5,9 +5,19 @@ import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
 import {
-  PLATFORMS, postToTelegram, parseTelegramTarget,
+  PLATFORMS, postToTelegram, parseTelegramTarget, downloadMedia,
   fetchTwitterTimeline, twitterItemToPost, parseTwitterHandle,
 } from './connectors.js';
+import {
+  instagramAuthUrl, instagramExchangeCode, instagramRefreshToken, instagramProfile,
+  publishToInstagram, setInstagramComments, listInstagramComments,
+  hideInstagramComment, deleteInstagramComment, replyToInstagramComment,
+  fetchInstagramOwnMedia, fetchInstagramPublicMedia, parseInstagramHandle,
+  facebookAuthUrl, facebookExchangeCode, facebookListPages,
+  publishToFacebook, fetchFacebookPagePosts, listFacebookComments,
+  hideFacebookComment, deleteFacebookComment, replyToFacebookComment,
+  setFacebookCommentControl,
+} from './meta.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,8 +29,20 @@ app.set('trust proxy', 1); // Trust Render TLS proxy
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ─── Genel adres ────────────────────────────────────────────────────────────
+// Instagram ve Facebook medyayı bizden İNDİRİR; bayt göndermeye izin vermezler.
+// Bu yüzden medyayı kısa süreliğine kendi sunucumuzdan yayınlamamız gerekiyor
+// ve dışarıdan erişilebilir adresimizi bilmemiz şart.
+const PUBLIC_BASE_URL = (
+  process.env.PUBLIC_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  ''
+).replace(/\/$/, '');
+
 // ─── In-memory stores ────────────────────────────────────────────────────────
 const tgQRSessions     = new Map();
+const metaAccounts     = new Map(); // accountId -> { platform, token, expiresAt, ... }
+const tempMedia        = new Map(); // token -> { buffer, mediaType, expiresAt }
 const tgActiveSessions = new Map(); // accountId -> { client, sessionString, accountName, apiId, apiHash }
 const syncRulesStore   = new Map(); // ruleId -> rule object
 const recentlySynced   = new Set(); // messageId -> to prevent duplicate tweets
@@ -44,7 +66,8 @@ function saveState() {
     // İmleçler olmadan yeniden başlatma sonrası kaynaklar "ilk tur" sayılır ve
     // son gönderiler tekrar paylaşılırdı.
     const cursors = Object.fromEntries(sourceCursors);
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules, cursors }, null, 2), { mode: 0o600 });
+    const meta = [...metaAccounts.values()];
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules, cursors, meta }, null, 2), { mode: 0o600 });
   } catch (e) {
     console.error('[Persist] Failed to save state:', e.message);
   }
@@ -52,12 +75,15 @@ function saveState() {
 
 function loadState() {
   try {
-    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [], cursors: {} };
+    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [], cursors: {}, meta: [] };
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    return { sessions: parsed.sessions || [], rules: parsed.rules || [], cursors: parsed.cursors || {} };
+    return {
+      sessions: parsed.sessions || [], rules: parsed.rules || [],
+      cursors: parsed.cursors || {}, meta: parsed.meta || [],
+    };
   } catch (e) {
     console.error('[Persist] Failed to load state:', e.message);
-    return { sessions: [], rules: [], cursors: {} };
+    return { sessions: [], rules: [], cursors: {}, meta: [] };
   }
 }
 
@@ -153,6 +179,58 @@ app.get('/api/config', async (_req, res) => {
 
   res.json({ telegramReady, autoTwitterAccount });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GEÇİCİ MEDYA SUNUCUSU
+//
+//  Meta platformları medyayı bir URL'den çeker. Telegram/X'ten gelen baytları
+//  tahmin edilemez bir adreste kısa süre yayınlayıp iş bitince siliyoruz.
+// ═══════════════════════════════════════════════════════════════════════════
+const TEMP_MEDIA_TTL_MS = 30 * 60 * 1000;
+
+function publishTempMedia(buffer, mediaType) {
+  if (!PUBLIC_BASE_URL) {
+    throw new Error('PUBLIC_URL ayarlı değil. Instagram/Facebook medya paylaşımı için sunucunun genel adresi gerekiyor.');
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  const ext = mediaType.startsWith('video/') ? 'mp4' : (mediaType === 'image/png' ? 'png' : 'jpg');
+  tempMedia.set(token, { buffer, mediaType, expiresAt: Date.now() + TEMP_MEDIA_TTL_MS });
+  return { token, url: `${PUBLIC_BASE_URL}/media/${token}.${ext}` };
+}
+
+function releaseTempMedia(tokens) {
+  for (const t of tokens) tempMedia.delete(t);
+}
+
+// Post'un baytlarını Meta'nın çekebileceği URL'lere çevirir.
+function postToPublicUrls(post) {
+  const tokens = [];
+  const mediaUrls = [];
+  for (const m of post.media || []) {
+    const { token, url } = publishTempMedia(m.data, m.mediaType);
+    tokens.push(token);
+    mediaUrls.push({ url, mediaType: m.mediaType });
+  }
+  return { tokens, mediaUrls };
+}
+
+app.get('/media/:file', (req, res) => {
+  const token = String(req.params.file).replace(/\.(jpg|png|mp4)$/i, '');
+  const entry = tempMedia.get(token);
+  if (!entry || Date.now() > entry.expiresAt) {
+    tempMedia.delete(token);
+    return res.status(404).send('Not found');
+  }
+  res.set('Content-Type', entry.mediaType);
+  res.set('Content-Length', String(entry.buffer.length));
+  res.set('Cache-Control', 'no-store');
+  return res.send(entry.buffer);
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, e] of tempMedia) if (now > e.expiresAt) tempMedia.delete(t);
+}, 5 * 60 * 1000).unref?.();
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TELEGRAM ─ QR LOGIN & SESSION MANAGEMENT
@@ -394,6 +472,156 @@ app.post('/api/telegram/session/start-listener', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  META (Instagram & Facebook) ─ OAuth ve hesap yönetimi
+// ═══════════════════════════════════════════════════════════════════════════
+const META_APP_ID     = process.env.META_APP_ID     || '';
+const META_APP_SECRET = process.env.META_APP_SECRET || '';
+const oauthStates = new Map(); // state -> { platform, createdAt }
+
+function metaRedirectUri(platform) {
+  return `${PUBLIC_BASE_URL}/api/${platform}/callback`;
+}
+
+function metaConfigError() {
+  if (!PUBLIC_BASE_URL) return 'PUBLIC_URL ayarlı değil. Render ortam değişkenlerine uygulamanın genel adresini ekle.';
+  if (!META_APP_ID || !META_APP_SECRET) return 'META_APP_ID ve META_APP_SECRET ayarlı değil. Meta geliştirici uygulamanı oluşturup bu değerleri Render ortam değişkenlerine ekle.';
+  return null;
+}
+
+function newOAuthState(platform) {
+  const state = crypto.randomBytes(16).toString('hex');
+  oauthStates.set(state, { platform, createdAt: Date.now() });
+  // Yarım kalan girişler birikmesin.
+  for (const [s, v] of oauthStates) {
+    if (Date.now() - v.createdAt > 10 * 60 * 1000) oauthStates.delete(s);
+  }
+  return state;
+}
+
+app.get('/api/meta/status', (_req, res) => {
+  res.json({
+    configured: !metaConfigError(),
+    error: metaConfigError(),
+    publicUrl: PUBLIC_BASE_URL || null,
+    redirectUris: {
+      instagram: PUBLIC_BASE_URL ? metaRedirectUri('instagram') : null,
+      facebook: PUBLIC_BASE_URL ? metaRedirectUri('facebook') : null,
+    },
+    accounts: [...metaAccounts.values()].map(publicMetaAccount),
+  });
+});
+
+function publicMetaAccount(a) {
+  return {
+    id: a.id, platform: a.platform, name: a.name, username: a.username,
+    avatar: a.avatar, followers: a.followers,
+    expiresAt: a.expiresAt, pages: a.pages?.map(p => ({ id: p.id, name: p.name, avatar: p.avatar })),
+  };
+}
+
+app.get('/api/:platform(instagram|facebook)/auth-url', (req, res) => {
+  const err = metaConfigError();
+  if (err) return res.status(400).json({ success: false, error: err });
+
+  const platform = req.params.platform;
+  const state = newOAuthState(platform);
+  const args = { appId: META_APP_ID, redirectUri: metaRedirectUri(platform), state };
+  const url = platform === 'instagram' ? instagramAuthUrl(args) : facebookAuthUrl(args);
+  return res.json({ success: true, url });
+});
+
+app.get('/api/:platform(instagram|facebook)/callback', async (req, res) => {
+  const platform = req.params.platform;
+  const { code, state, error_description: errDesc } = req.query;
+
+  const finish = (ok, message) =>
+    res.send(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center;max-width:420px;padding:24px">
+<div style="font-size:44px">${ok ? '✅' : '❌'}</div>
+<h2 style="margin:12px 0">${ok ? 'Hesap bağlandı' : 'Bağlanamadı'}</h2>
+<p style="color:#94a3b8;font-size:14px">${message}</p>
+<p style="color:#64748b;font-size:12px">Bu pencereyi kapatabilirsin.</p>
+</div><script>setTimeout(()=>window.close(),${ok ? 2500 : 8000})</script></body>`);
+
+  if (errDesc) return finish(false, String(errDesc));
+  if (!code) return finish(false, 'Meta yetkilendirme kodu göndermedi.');
+  if (!state || oauthStates.get(String(state))?.platform !== platform) {
+    // State eşleşmiyorsa bu isteği biz başlatmamışız demektir.
+    return finish(false, 'Güvenlik doğrulaması başarısız (state uyuşmadı). Baştan dene.');
+  }
+  oauthStates.delete(String(state));
+
+  try {
+    const args = {
+      appId: META_APP_ID, appSecret: META_APP_SECRET,
+      redirectUri: metaRedirectUri(platform), code: String(code),
+    };
+
+    if (platform === 'instagram') {
+      const tok = await instagramExchangeCode(args);
+      const profile = await instagramProfile(tok.token);
+      const id = `ig-${profile.id}`;
+      metaAccounts.set(id, {
+        id, platform: 'instagram', igUserId: profile.id,
+        name: profile.name, username: profile.username, avatar: profile.avatar,
+        followers: profile.followers, token: tok.token, expiresAt: tok.expiresAt,
+      });
+      saveState();
+      return finish(true, `Instagram: @${profile.username}`);
+    }
+
+    const tok = await facebookExchangeCode(args);
+    const pages = await facebookListPages(tok.token);
+    if (!pages.length) {
+      return finish(false, 'Bu hesapta yönetebileceğin bir Facebook Sayfası yok. Facebook kişisel profiline API ile paylaşım yapılamıyor, Sayfa gerekiyor.');
+    }
+    const id = 'fb-user';
+    metaAccounts.set(id, {
+      id, platform: 'facebook', name: pages[0].name,
+      username: pages.map(p => p.name).join(', '),
+      avatar: pages[0].avatar, token: tok.token, expiresAt: tok.expiresAt, pages,
+    });
+    saveState();
+    return finish(true, `Facebook Sayfaları: ${pages.map(p => p.name).join(', ')}`);
+  } catch (e) {
+    return finish(false, e.message);
+  }
+});
+
+app.delete('/api/meta/accounts/:id', (req, res) => {
+  const existed = metaAccounts.delete(req.params.id);
+  saveState();
+  res.json({ success: existed });
+});
+
+// 60 günlük jetonlar süresi dolmadan yenilenirse ömürleri tekrar uzuyor.
+// Günde bir kontrol edip 15 günden az kalanları tazeliyoruz; böylece hesap
+// elle müdahale olmadan bağlı kalıyor.
+const TOKEN_REFRESH_THRESHOLD_MS = 15 * 24 * 60 * 60 * 1000;
+
+async function refreshMetaTokens() {
+  for (const acc of metaAccounts.values()) {
+    if (acc.platform !== 'instagram') continue; // Sayfa jetonları süresiz
+    if (!acc.expiresAt || acc.expiresAt - Date.now() > TOKEN_REFRESH_THRESHOLD_MS) continue;
+    try {
+      const r = await instagramRefreshToken(acc.token);
+      acc.token = r.token;
+      acc.expiresAt = r.expiresAt;
+      saveState();
+      console.log(`[Meta] Instagram jetonu yenilendi: @${acc.username}`);
+    } catch (e) {
+      console.error(`[Meta] Jeton yenilenemedi (@${acc.username}):`, e.message);
+      pushSyncLog({
+        source: `Instagram @${acc.username}`,
+        messagePreview: 'Erişim jetonu yenilenemedi',
+        targets: [], status: 'error',
+        details: `${e.message} Hesabı yeniden bağlaman gerekebilir.`,
+      });
+    }
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TWITTER API (Verification & Tweeting via Official OAuth 1.0a)
@@ -1121,6 +1349,134 @@ app.post('/api/sync/test', async (req, res) => {
   return res.json({ success: failCount === 0, results, error: failCount > 0 ? results.map(r => r.error).join(', ') : null });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  YORUM YÖNETİMİ (Instagram & Facebook)
+// ═══════════════════════════════════════════════════════════════════════════
+function metaAccountOr404(req, res) {
+  const acc = metaAccounts.get(req.params.accountId);
+  if (!acc) {
+    res.status(404).json({ success: false, error: 'Hesap bağlı değil.' });
+    return null;
+  }
+  return acc;
+}
+
+function fbPageOf(acc, pageId) {
+  return (acc.pages || []).find(p => p.id === pageId) || acc.pages?.[0];
+}
+
+// Bir gönderinin yorumlarını listele
+app.get('/api/meta/:accountId/media/:mediaId/comments', async (req, res) => {
+  const acc = metaAccountOr404(req, res);
+  if (!acc) return;
+  try {
+    const comments = acc.platform === 'instagram'
+      ? await listInstagramComments({ token: acc.token }, req.params.mediaId)
+      : await listFacebookComments(fbPageOf(acc, req.query.pageId), req.params.mediaId);
+    return res.json({ success: true, comments });
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Yorumları aç/kapat (Instagram: comment_enabled, Facebook: comment_control)
+app.post('/api/meta/:accountId/media/:mediaId/comment-setting', async (req, res) => {
+  const acc = metaAccountOr404(req, res);
+  if (!acc) return;
+  const { enabled, mode, pageId } = req.body || {};
+  try {
+    if (acc.platform === 'instagram') {
+      await setInstagramComments({ token: acc.token }, req.params.mediaId, enabled !== false);
+    } else {
+      await setFacebookCommentControl(fbPageOf(acc, pageId), req.params.mediaId, mode || 'EVERYONE');
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Tek bir yorumu gizle / göster / sil / yanıtla
+app.post('/api/meta/:accountId/comments/:commentId/:action', async (req, res) => {
+  const acc = metaAccountOr404(req, res);
+  if (!acc) return;
+  const { action, commentId } = req.params;
+  const { message, pageId } = req.body || {};
+  const isIG = acc.platform === 'instagram';
+  const ctx = isIG ? { token: acc.token } : fbPageOf(acc, pageId);
+
+  try {
+    switch (action) {
+      case 'hide':
+      case 'unhide': {
+        const hidden = action === 'hide';
+        const r = isIG
+          ? await hideInstagramComment(ctx, commentId, hidden)
+          : await hideFacebookComment(ctx, commentId, hidden);
+        return res.json(r);
+      }
+      case 'delete':
+        return res.json(isIG
+          ? await deleteInstagramComment(ctx, commentId)
+          : await deleteFacebookComment(ctx, commentId));
+      case 'reply': {
+        if (!message?.trim()) return res.status(400).json({ success: false, error: 'Yanıt metni boş.' });
+        return res.json(isIG
+          ? await replyToInstagramComment(ctx, commentId, message)
+          : await replyToFacebookComment(ctx, commentId, message));
+      }
+      default:
+        return res.status(400).json({ success: false, error: `Bilinmeyen işlem: ${action}` });
+    }
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Bağlı Meta hesabının kendi gönderilerini listele (yorum yönetimi için)
+app.get('/api/meta/:accountId/media', async (req, res) => {
+  const acc = metaAccountOr404(req, res);
+  if (!acc) return;
+  try {
+    const items = acc.platform === 'instagram'
+      ? await fetchInstagramOwnMedia({ igUserId: acc.igUserId, token: acc.token })
+      : await fetchFacebookPagePosts(fbPageOf(acc, req.query.pageId));
+    return res.json({ success: true, items });
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Elle paylaşım: arayüzden yüklenen medyayı doğrudan gönder.
+app.post('/api/meta/:accountId/publish', async (req, res) => {
+  const acc = metaAccountOr404(req, res);
+  if (!acc) return;
+  const { text, media, kind, disableComments, commentControl, pageId } = req.body || {};
+
+  // media: [{ base64, mediaType }]
+  const post = {
+    text: text || '',
+    media: (media || []).map(m => ({ data: Buffer.from(m.base64, 'base64'), mediaType: m.mediaType })),
+  };
+  const target = {
+    platform: acc.platform, accountId: acc.id, pageId, name: acc.username || acc.name,
+    options: { kind: kind || 'post', disableComments, commentControl },
+  };
+  try {
+    const r = await deliverToTarget(target, post, {});
+    pushSyncLog({
+      source: `Elle → ${PLATFORMS[acc.platform]?.label}`,
+      messagePreview: (post.text || '📷 Medya').slice(0, 80),
+      targets: [target.name],
+      status: r.success ? 'success' : 'error',
+      details: r.success ? (r.warning || 'Paylaşıldı') : r.error,
+    });
+    return res.status(r.success ? 200 : 400).json(r);
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
+});
+
 // Kaynağın gerçekten okunabildiğini kural kaydetmeden önce görebilmek için.
 app.post('/api/source/preview', async (req, res) => {
   const { platform, handle } = req.body || {};
@@ -1137,6 +1493,20 @@ app.post('/api/source/preview', async (req, res) => {
         })),
       });
     }
+    if (platform === 'instagram') {
+      // business_discovery çağrısı bağlı bir profesyonel hesap üzerinden yapılır.
+      const acc = [...metaAccounts.values()].find(a => a.platform === 'instagram');
+      if (!acc) return res.status(400).json({ success: false, error: 'Önce kendi Instagram hesabını bağla; başka hesapları ancak bağlı bir hesap üzerinden okuyabiliyoruz.' });
+      const r = await fetchInstagramPublicMedia({ igUserId: acc.igUserId, token: acc.token }, handle);
+      return res.json({
+        success: true, count: r.items.length, author: `@${r.username}`,
+        items: r.items.slice(0, 5).map(i => ({
+          id: i.id, text: i.text.slice(0, 140), createdAt: i.createdAt,
+          media: i.media.map(m => m.mediaType), url: i.url,
+        })),
+      });
+    }
+
     return res.status(400).json({ success: false, error: `"${platform}" için önizleme henüz yok.` });
   } catch (e) {
     return res.status(400).json({ success: false, error: e.message });
@@ -1461,6 +1831,44 @@ async function deliverToTarget(target, post, rule) {
         return await postToTelegram(sess.client, target.chatId, post, opts);
       }
 
+      case 'instagram': {
+        const acc = metaAccounts.get(target.accountId);
+        if (!acc) return { success: false, error: 'Hedef Instagram hesabı bağlı değil.' };
+        // Baytları Meta'nın çekebileceği geçici adreslere koyup iş bitince siliyoruz.
+        const { tokens, mediaUrls } = postToPublicUrls(post);
+        try {
+          return await publishToInstagram(
+            { igUserId: acc.igUserId, token: acc.token },
+            { text: post.text, mediaUrls },
+            { kind: opts.kind || 'post', disableComments: !!opts.disableComments },
+          );
+        } finally {
+          releaseTempMedia(tokens);
+        }
+      }
+
+      case 'facebook': {
+        const acc = metaAccounts.get(target.accountId);
+        if (!acc) return { success: false, error: 'Facebook hesabı bağlı değil.' };
+        const page = (acc.pages || []).find(p => p.id === target.pageId) || acc.pages?.[0];
+        if (!page) return { success: false, error: 'Hedef Facebook Sayfası bulunamadı.' };
+
+        const { tokens, mediaUrls } = postToPublicUrls(post);
+        try {
+          const r = await publishToFacebook(page, { text: post.text, mediaUrls }, { kind: opts.kind || 'post' });
+          if (r.success && opts.commentControl && opts.commentControl !== 'EVERYONE' && r.id) {
+            try {
+              await setFacebookCommentControl(page, r.id, opts.commentControl);
+            } catch (e) {
+              return { ...r, warning: `Paylaşıldı ama yorum ayarı uygulanamadı: ${e.message}` };
+            }
+          }
+          return r;
+        } finally {
+          releaseTempMedia(tokens);
+        }
+      }
+
       default:
         return { success: false, error: `Bilinmeyen hedef platform: ${target.platform}` };
     }
@@ -1591,11 +1999,78 @@ async function pollTwitterSource(rule) {
   }
 }
 
+// Instagram/Facebook öğelerini ortak Post biçimine çevirir. Meta medyayı
+// imzalı geçici adreslerde tutar, bu yüzden hemen indiriyoruz.
+async function metaItemToPost(item, label) {
+  const media = [];
+  for (const m of item.media || []) {
+    try {
+      media.push({ data: await downloadMedia(m.url, m.mediaType), mediaType: m.mediaType });
+    } catch (e) {
+      console.warn(`[${label}] Medya atlandı:`, e.message);
+    }
+  }
+  return { text: item.text, media, author: item.author || null, sourceUrl: item.url, sourceLabel: label };
+}
+
+async function pollMetaSource(rule) {
+  const acc = metaAccounts.get(rule.sourceAccountId);
+  if (!acc) return;
+
+  let items = [];
+  let label = '';
+  if (rule.sourcePlatform === 'instagram') {
+    const handle = rule.sourceHandle && parseInstagramHandle(rule.sourceHandle);
+    // Kendi hesabın değilse business_discovery ile herkese açık profesyonel
+    // hesapları okuyabiliyoruz; Instagram kişisel hesaplara izin vermiyor.
+    if (handle && handle.toLowerCase() !== (acc.username || '').toLowerCase()) {
+      const r = await fetchInstagramPublicMedia({ igUserId: acc.igUserId, token: acc.token }, handle);
+      items = r.items;
+      label = `Instagram @${r.username}`;
+    } else {
+      items = await fetchInstagramOwnMedia({ igUserId: acc.igUserId, token: acc.token });
+      label = `Instagram @${acc.username}`;
+    }
+  } else {
+    const page = (acc.pages || []).find(p => p.id === rule.sourcePageId) || acc.pages?.[0];
+    if (!page) return;
+    items = await fetchFacebookPagePosts(page);
+    label = `Facebook ${page.name}`;
+  }
+
+  if (!items.length) return;
+
+  const cursor = sourceCursors.get(rule.id);
+  // Meta kimlikleri artan sayı değil; en yeni öğe listenin başında geliyor.
+  const newest = items[0].id;
+  if (!cursor) {
+    sourceCursors.set(rule.id, newest);
+    console.log(`[${label}] ${rule.title}: başlangıç noktası ayarlandı.`);
+    return;
+  }
+  if (cursor === newest) return;
+
+  const seenIdx = items.findIndex(i => i.id === cursor);
+  // İmleç listede yoksa (çok yeni gönderi birikmiş) yalnızca en yenisini alıyoruz;
+  // aksi hâlde 25 eski gönderi birden paylaşılırdı.
+  const fresh = (seenIdx === -1 ? items.slice(0, 1) : items.slice(0, seenIdx)).reverse();
+  sourceCursors.set(rule.id, newest);
+  if (!fresh.length) return;
+
+  console.log(`[${label}] ${rule.title}: ${fresh.length} yeni gönderi.`);
+  for (const item of fresh) {
+    await executeSyncRule(rule, await metaItemToPost(item, label));
+  }
+}
+
 async function pollAllSources() {
   for (const rule of syncRulesStore.values()) {
     if (!rule.enabled) continue;
     try {
       if (rule.sourcePlatform === 'twitter') await pollTwitterSource(rule);
+      else if (rule.sourcePlatform === 'instagram' || rule.sourcePlatform === 'facebook') {
+        await pollMetaSource(rule);
+      }
     } catch (e) {
       console.error(`[Yoklayıcı] ${rule.title} hatası:`, e.message);
     }
@@ -1686,6 +2161,9 @@ for (const r of saved.rules) {
 for (const [ruleId, cursor] of Object.entries(saved.cursors || {})) {
   sourceCursors.set(ruleId, cursor);
 }
+for (const a of saved.meta || []) {
+  metaAccounts.set(a.id, a);
+}
 
 app.listen(PORT, () => {
   console.log(`🚀 Telegram-Twitter AutoSync server running on port ${PORT}`);
@@ -1702,6 +2180,10 @@ app.listen(PORT, () => {
 
   // Yoklamalı kaynakları (X vb.) açılıştan kısa süre sonra bir kez tara.
   setTimeout(() => { pollAllSources().catch(console.error); }, 30000);
+
+  // Meta jetonlarını açılışta ve günde bir yenile ki bağlantı kendiliğinden sürsün.
+  setTimeout(() => { refreshMetaTokens().catch(console.error); }, 45000);
+  setInterval(() => { refreshMetaTokens().catch(console.error); }, 24 * 60 * 60 * 1000).unref?.();
   // İmleçleri kaybetmemek için düzenli olarak diske yaz.
   setInterval(saveState, 5 * 60 * 1000).unref?.();
 });
