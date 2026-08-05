@@ -4,6 +4,10 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
+import {
+  PLATFORMS, postToTelegram, parseTelegramTarget,
+  fetchTwitterTimeline, twitterItemToPost, parseTwitterHandle,
+} from './connectors.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,7 +41,10 @@ function saveState() {
       apiHash: s.apiHash,
     }));
     const rules = [...syncRulesStore.values()];
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules }, null, 2), { mode: 0o600 });
+    // İmleçler olmadan yeniden başlatma sonrası kaynaklar "ilk tur" sayılır ve
+    // son gönderiler tekrar paylaşılırdı.
+    const cursors = Object.fromEntries(sourceCursors);
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules, cursors }, null, 2), { mode: 0o600 });
   } catch (e) {
     console.error('[Persist] Failed to save state:', e.message);
   }
@@ -45,12 +52,12 @@ function saveState() {
 
 function loadState() {
   try {
-    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [] };
+    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [], cursors: {} };
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    return { sessions: parsed.sessions || [], rules: parsed.rules || [] };
+    return { sessions: parsed.sessions || [], rules: parsed.rules || [], cursors: parsed.cursors || {} };
   } catch (e) {
     console.error('[Persist] Failed to load state:', e.message);
-    return { sessions: [], rules: [] };
+    return { sessions: [], rules: [], cursors: {} };
   }
 }
 
@@ -1088,55 +1095,52 @@ app.post('/api/sync/test', async (req, res) => {
   const rule = syncRulesStore.get(ruleId);
   if (!rule) return res.status(404).json({ success: false, error: 'Kural bulunamadı.' });
 
-  const twitterAccounts = rule.targetAccounts || [];
-  if (!twitterAccounts.length) return res.status(400).json({ success: false, error: 'Kuralda hedef Twitter hesabı seçilmemiş.' });
+  const targets = ruleTargets(rule);
+  if (!targets.length) return res.status(400).json({ success: false, error: 'Kurala hedef hesap eklenmemiş.' });
 
-  const testText = text || `⚡ OmniSync Test Tweeti [${new Date().toLocaleTimeString('tr-TR')}]`;
+  const testText = text || `⚡ OmniSync Test Gönderisi [${new Date().toLocaleTimeString('tr-TR')}]`;
   const formattedText = buildTweetText(testText, rule);
 
   if (!formattedText) return res.status(400).json({ success: false, error: 'Yasaklı kelime filtresi mesajı engelledi.' });
 
   const results = [];
-  for (const twAcc of twitterAccounts) {
-    const c = twAcc.credentials || {};
-    try {
-      if (Array.isArray(c.cookies) && c.cookies.length > 0) {
-        // Free & Unlimited Cookie Mode
-        const freeRes = await postTweetViaCookies(c.cookies, formattedText, [], rule.replyMode);
-        results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
-      } else if (c.consumerKey && c.consumerSecret) {
-        // Official API Key Mode
-        const url = 'https://api.twitter.com/2/tweets';
-        const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: authHeader },
-          body: JSON.stringify({ text: formattedText }),
-        });
-        const d = await r.json();
-        if (r.ok && d.data?.id) {
-          results.push({ account: twAcc.name, success: true, tweetId: d.data.id });
-        } else {
-          results.push({ account: twAcc.name, success: false, error: JSON.stringify(d.errors || d.detail || d) });
-        }
-      } else {
-        results.push({ account: twAcc.name, success: false, error: 'Twitter hesabı için giriş bilgisi/çerez bulunamadı.' });
-      }
-    } catch (e) {
-      results.push({ account: twAcc.name, success: false, error: e.message });
-    }
+  for (const target of targets) {
+    const r = await deliverToTarget(target, { text: formattedText, media: [] }, rule);
+    results.push({ account: targetLabel(target), ...r });
   }
 
   const failCount = results.filter(r => !r.success).length;
   pushSyncLog({
     source: `Test → ${rule.title}`,
     messagePreview: formattedText.slice(0, 80),
-    targets: twitterAccounts.map(a => a.name),
+    targets: targets.map(targetLabel),
     status: failCount === 0 ? 'success' : 'error',
     details: results.map(r => `${r.account}: ${r.success ? '✅ Gönderildi' : '❌ ' + r.error}`).join(' · '),
   });
 
   return res.json({ success: failCount === 0, results, error: failCount > 0 ? results.map(r => r.error).join(', ') : null });
+});
+
+// Kaynağın gerçekten okunabildiğini kural kaydetmeden önce görebilmek için.
+app.post('/api/source/preview', async (req, res) => {
+  const { platform, handle } = req.body || {};
+  try {
+    if (platform === 'twitter') {
+      const items = await fetchTwitterTimeline(handle);
+      return res.json({
+        success: true,
+        count: items.length,
+        author: items[0]?.author || null,
+        items: items.slice(0, 5).map(i => ({
+          id: i.id, text: i.text.slice(0, 140), createdAt: i.createdAt,
+          media: i.media.map(m => m.mediaType), isRetweet: i.isRetweet, url: i.url,
+        })),
+      });
+    }
+    return res.status(400).json({ success: false, error: `"${platform}" için önizleme henüz yok.` });
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
 });
 
 // ─── Format Tweet Text ──────────────────────────────────────────────────────
@@ -1377,9 +1381,20 @@ async function startTelegramListener(accountId) {
         return;
       }
 
-      console.log(`[Telegram] ${matchingRules.length} kural eşleşti, tweet gönderiliyor...`);
+      console.log(`[Telegram] ${matchingRules.length} kural eşleşti, gönderiliyor...`);
+
+      // Medyayı kural başına değil bir kez indiriyoruz; aynı mesaj birden çok
+      // kurala uyduğunda aynı dosyayı tekrar tekrar çekmenin anlamı yok.
+      const post = {
+        text: rawText,
+        media: await extractTelegramMedia(msg),
+        author: sender?.username ? `@${sender.username}` : null,
+        sourceUrl: chatUsername ? `https://t.me/${chatUsername}/${msg.id}` : null,
+        sourceLabel: `Telegram${chatUsername ? ' @' + chatUsername : ''}`,
+      };
+
       for (const rule of matchingRules) {
-        await executeSyncRule(rule, msg, rule.targetAccounts || []);
+        await executeSyncRule(rule, post);
       }
     }, new NewMessage({}));
 
@@ -1389,89 +1404,205 @@ async function startTelegramListener(accountId) {
   }
 }
 
-async function executeSyncRule(rule, message, twitterAccounts) {
+// ─── Kural Hedefleri ────────────────────────────────────────────────────────
+// Eski kurallarda hedef yalnızca Twitter'dı (`targetAccounts`). Yeni kurallar
+// çok platformlu `targets` dizisi kullanıyor. Eskileri okurken dönüştürüyoruz,
+// böylece mevcut kurallar deploy sonrası çalışmaya devam ediyor.
+function ruleTargets(rule) {
+  if (Array.isArray(rule.targets) && rule.targets.length) return rule.targets;
+  return (rule.targetAccounts || []).map(acc => ({
+    platform: 'twitter',
+    name: acc.name,
+    credentials: acc.credentials,
+    options: { replyMode: rule.replyMode || 'everyone' },
+  }));
+}
+
+function targetLabel(t) {
+  const p = PLATFORMS[t.platform];
+  return `${p?.icon || ''} ${t.name || t.chatId || t.platform}`.trim();
+}
+
+// Tek bir hedefe gönderim. Platform ne olursa olsun aynı Post biçimini alır.
+async function deliverToTarget(target, post, rule) {
+  const opts = target.options || {};
+  try {
+    switch (target.platform) {
+      case 'twitter': {
+        const c = target.credentials || {};
+        if (Array.isArray(c.cookies) && c.cookies.length > 0) {
+          const r = await postTweetViaCookies(c.cookies, post.text, post.media, opts.replyMode || rule.replyMode);
+          return { success: r.success, error: r.error };
+        }
+        if (c.consumerKey && c.consumerSecret) {
+          if (!post.text) {
+            return { success: false, error: 'Görsel/video paylaşımı yalnızca çerez (auth_token) modunda destekleniyor.' };
+          }
+          const url = 'https://api.twitter.com/2/tweets';
+          const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
+          const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+            body: JSON.stringify({ text: post.text }),
+          });
+          const d = await r.json();
+          return {
+            success: !!(r.ok && d.data?.id),
+            error: d.errors ? d.errors[0]?.message : (d.detail || d.title),
+          };
+        }
+        return { success: false, error: 'Twitter hesabı için giriş bilgisi bulunamadı.' };
+      }
+
+      case 'telegram': {
+        const sess = tgActiveSessions.get(target.accountId);
+        if (!sess) return { success: false, error: 'Hedef Telegram hesabı bağlı değil.' };
+        if (!sess.client) await startTelegramListener(target.accountId);
+        return await postToTelegram(sess.client, target.chatId, post, opts);
+      }
+
+      default:
+        return { success: false, error: `Bilinmeyen hedef platform: ${target.platform}` };
+    }
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// Kaynağı ne olursa olsun normalize edilmiş bir gönderiyi kuralın tüm
+// hedeflerine dağıtır.
+async function executeSyncRule(rule, post) {
   if (!rule.enabled) return;
 
-  const rawText = message.text || message.caption || '';
+  const targets = ruleTargets(rule);
+  const sourceLabel = post.sourceLabel || PLATFORMS[rule.sourcePlatform || 'telegram']?.label || 'Kaynak';
+  const rawText = post.text || '';
   const text = buildTweetText(rawText, rule);
-  const media = await extractTelegramMedia(message);
+  const media = post.media || [];
 
-  // Metin yoksa ama görsel/video varsa yine de tweet at; yalnızca
-  // yasaklı kelimeye takılan veya tamamen boş mesajları filtrele.
   if (!text && !media.length) {
     pushSyncLog({
-      source: `Telegram → ${rule.title}`,
+      source: `${sourceLabel} → ${rule.title}`,
       messagePreview: (rawText || '(boş mesaj)').slice(0, 80),
-      targets: (twitterAccounts || []).map(a => a.name),
+      targets: targets.map(targetLabel),
       status: 'filtered',
       details: rawText.trim() ? 'Yasaklı kelime filtresine takıldı.' : 'Mesajda metin ve medya yok.',
     });
     return;
   }
   if (!text && rawText.trim()) {
-    // Metin yasaklı kelimeye takıldıysa medya olsa bile gönderme
+    // Metin yasaklı kelimeye takıldıysa medya olsa bile gönderme.
     pushSyncLog({
-      source: `Telegram → ${rule.title}`,
+      source: `${sourceLabel} → ${rule.title}`,
       messagePreview: rawText.slice(0, 80),
-      targets: (twitterAccounts || []).map(a => a.name),
+      targets: targets.map(targetLabel),
       status: 'filtered',
       details: 'Yasaklı kelime filtresine takıldı.',
     });
     return;
   }
 
-  if (!twitterAccounts?.length) {
+  if (!targets.length) {
     pushSyncLog({
-      source: `Telegram → ${rule.title}`,
+      source: `${sourceLabel} → ${rule.title}`,
       messagePreview: text.slice(0, 80),
       targets: [],
       status: 'error',
-      details: 'Hedef Twitter hesabı seçilmemiş.',
+      details: 'Kurala hedef hesap eklenmemiş.',
     });
     return;
   }
 
+  const outgoing = { ...post, text };
   const results = [];
-  for (const twAcc of twitterAccounts) {
-    const c = twAcc.credentials || {};
-    try {
-      if (Array.isArray(c.cookies) && c.cookies.length > 0) {
-        // Free & Unlimited Cookie Mode (görsel/video dahil)
-        const freeRes = await postTweetViaCookies(c.cookies, text, media, rule.replyMode);
-        results.push({ account: twAcc.name, success: freeRes.success, error: freeRes.error });
-      } else if (c.consumerKey && c.consumerSecret) {
-        // Official API Key Mode (yalnızca metin; medya çerez modunda destekleniyor)
-        if (!text) {
-          results.push({ account: twAcc.name, success: false, error: 'Görsel/video paylaşımı yalnızca çerez (auth_token) modunda destekleniyor.' });
-          continue;
-        }
-        const url = 'https://api.twitter.com/2/tweets';
-        const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: authHeader },
-          body: JSON.stringify({ text }),
-        });
-        const d = await r.json();
-        const ok = r.ok && d.data?.id;
-        results.push({ account: twAcc.name, success: !!ok, error: d.errors ? d.errors[0]?.message : (d.detail || d.title) });
-      } else {
-        results.push({ account: twAcc.name, success: false, error: 'Twitter hesabı için giriş bilgisi bulunamadı.' });
-      }
-    } catch (e) {
-      results.push({ account: twAcc.name, success: false, error: e.message });
-    }
+  for (const target of targets) {
+    const r = await deliverToTarget(target, outgoing, rule);
+    results.push({ account: targetLabel(target), ...r });
   }
 
   const failCount = results.filter(r => !r.success).length;
   pushSyncLog({
-    source: `Telegram → ${rule.title}`,
+    source: `${sourceLabel} → ${rule.title}`,
     messagePreview: (text || '📷 Medya paylaşımı').slice(0, 80) + (media.length ? ' [+medya]' : ''),
-    targets: twitterAccounts.map(a => a.name),
+    targets: targets.map(targetLabel),
     status: failCount === 0 ? 'success' : (failCount === results.length ? 'error' : 'partial'),
     details: results.map(r => `${r.account}: ${r.success ? '✅ Gönderildi' : '❌ ' + (r.error || 'Hata')}`).join(' · '),
   });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  KAYNAK YOKLAYICI (Telegram dışındaki platformlar)
+//
+//  Telegram anlık olay gönderir (push); X/Instagram/Facebook için düzenli
+//  aralıklarla yeni gönderi var mı diye bakmamız gerekiyor.
+// ═══════════════════════════════════════════════════════════════════════════
+const sourceCursors = new Map(); // ruleId -> en son işlenen gönderi kimliği
+const POLL_INTERVAL_MS = 3 * 60 * 1000;
+
+// Gönderi kimlikleri X'te artan sayılardır ama 64-bit olduğu için sayıya
+// çevirmek hassasiyet kaybettirir; string olarak uzunluk+sözlük sırası
+// karşılaştırması güvenli.
+function idIsNewer(a, b) {
+  if (!b) return true;
+  if (a.length !== b.length) return a.length > b.length;
+  return a > b;
+}
+
+async function pollTwitterSource(rule) {
+  const handle = rule.sourceHandle || rule.sourceChannelId;
+  if (!parseTwitterHandle(handle)) return;
+
+  let items;
+  try {
+    items = await fetchTwitterTimeline(handle);
+  } catch (e) {
+    // Hız sınırı normal işleyişin parçası, hata olarak kaydetmiyoruz.
+    if (!/hız sınırı/i.test(e.message)) {
+      console.warn(`[X kaynak] ${rule.title}: ${e.message}`);
+    }
+    return;
+  }
+  if (!items.length) return;
+
+  const newest = items.reduce((m, i) => (idIsNewer(i.id, m) ? i.id : m), '');
+  const cursor = sourceCursors.get(rule.id);
+
+  // İlk turda geçmişi göndermiyoruz; yoksa kural eklenir eklenmez son 20
+  // gönderi arka arkaya paylaşılırdı.
+  if (!cursor) {
+    sourceCursors.set(rule.id, newest);
+    console.log(`[X kaynak] ${rule.title}: başlangıç noktası ${newest} olarak ayarlandı.`);
+    return;
+  }
+
+  const fresh = items
+    .filter(i => idIsNewer(i.id, cursor))
+    .filter(i => !(rule.skipRetweets && i.isRetweet))
+    .filter(i => !(rule.skipReplies && i.isReply))
+    .sort((a, b) => (idIsNewer(a.id, b.id) ? 1 : -1)); // eskiden yeniye
+
+  sourceCursors.set(rule.id, newest);
+  if (!fresh.length) return;
+
+  console.log(`[X kaynak] ${rule.title}: ${fresh.length} yeni gönderi bulundu.`);
+  for (const item of fresh) {
+    const post = await twitterItemToPost(item);
+    await executeSyncRule(rule, post);
+  }
+}
+
+async function pollAllSources() {
+  for (const rule of syncRulesStore.values()) {
+    if (!rule.enabled) continue;
+    try {
+      if (rule.sourcePlatform === 'twitter') await pollTwitterSource(rule);
+    } catch (e) {
+      console.error(`[Yoklayıcı] ${rule.title} hatası:`, e.message);
+    }
+  }
+}
+
+setInterval(() => { pollAllSources().catch(() => {}); }, POLL_INTERVAL_MS).unref?.();
 
 // ─── Oturum Sağlık Takibi ───────────────────────────────────────────────────
 // Çerezler çıkış yapılana veya şifre değiştirilene kadar geçerli kalır, ama bu
@@ -1483,7 +1614,8 @@ const HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 function connectedTwitterAccounts() {
   const seen = new Map();
   for (const rule of syncRulesStore.values()) {
-    for (const acc of rule.targetAccounts || []) {
+    for (const acc of ruleTargets(rule)) {
+      if (acc.platform !== 'twitter') continue;
       const cookies = acc.credentials?.cookies;
       if (Array.isArray(cookies) && cookies.length && !seen.has(acc.name)) {
         seen.set(acc.name, cookies);
@@ -1551,6 +1683,9 @@ for (const s of saved.sessions) {
 for (const r of saved.rules) {
   syncRulesStore.set(r.id, r);
 }
+for (const [ruleId, cursor] of Object.entries(saved.cursors || {})) {
+  sourceCursors.set(ruleId, cursor);
+}
 
 app.listen(PORT, () => {
   console.log(`🚀 Telegram-Twitter AutoSync server running on port ${PORT}`);
@@ -1564,4 +1699,9 @@ app.listen(PORT, () => {
   // Twitter oturumlarını açılışta ve 6 saatte bir kontrol et.
   setTimeout(() => { checkTwitterSessions().catch(console.error); }, 20000);
   setInterval(() => { checkTwitterSessions().catch(console.error); }, HEALTH_INTERVAL_MS);
+
+  // Yoklamalı kaynakları (X vb.) açılıştan kısa süre sonra bir kez tara.
+  setTimeout(() => { pollAllSources().catch(console.error); }, 30000);
+  // İmleçleri kaybetmemek için düzenli olarak diske yaz.
+  setInterval(saveState, 5 * 60 * 1000).unref?.();
 });
