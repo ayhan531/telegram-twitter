@@ -4,6 +4,77 @@ import {
   Eye, EyeOff, Loader2, QrCode, AlertCircle, Info, RefreshCw, Key, ShieldCheck
 } from 'lucide-react';
 
+function MetaCard({
+  platform, icon, title, subtitle, gradient, buttonCls,
+  status, accounts, onConnect, onRemove, onShowSetup, emptyText,
+}) {
+  const connected = accounts.length > 0;
+  return (
+    <div className="p-6 rounded-2xl glass-panel border border-slate-700 bg-slate-900/40 flex flex-col justify-between space-y-5">
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-3">
+            <div className={`w-12 h-12 rounded-xl ${gradient} text-white font-bold flex items-center justify-center text-2xl shadow-lg`}>{icon}</div>
+            <div>
+              <h3 className="font-bold text-base text-white">{title}</h3>
+              <p className="text-xs text-slate-400">{subtitle}</p>
+            </div>
+          </div>
+          {connected ? (
+            <span className="px-3 py-1 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-500/30 text-xs font-bold flex items-center space-x-1">
+              <CheckCircle2 size={13} /><span>Bağlı ({accounts.length})</span>
+            </span>
+          ) : (
+            <span className="px-3 py-1 rounded-full bg-slate-800 text-slate-400 border border-slate-700 text-xs font-semibold">
+              Bağlı Değil
+            </span>
+          )}
+        </div>
+
+        {connected ? (
+          <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
+            {accounts.map(acc => (
+              <div key={acc.id} className="flex items-center justify-between">
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-white truncate">{acc.name}</p>
+                  <p className="text-[11px] text-fuchsia-400 truncate">
+                    {acc.username ? (platform === 'instagram' ? `@${acc.username}` : acc.username) : ''}
+                  </p>
+                  {acc.expiresAt && (
+                    <p className="text-[10px] text-slate-500">
+                      Erişim {Math.max(0, Math.round((acc.expiresAt - Date.now()) / 86400000))} gün geçerli · otomatik yenilenir
+                    </p>
+                  )}
+                </div>
+                <button onClick={() => onRemove(acc.id)} className="p-1.5 rounded-lg text-rose-400 hover:bg-rose-950/40 border border-rose-500/20">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-xs text-slate-400 leading-relaxed">{emptyText}</p>
+        )}
+
+        {!status.configured && (
+          <button onClick={onShowSetup}
+            className="w-full p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/30 text-[11px] text-amber-200 text-left hover:bg-amber-950/60">
+            ⚠️ Meta uygulaması henüz ayarlanmamış. <strong className="underline">Kurulum adımlarını gör →</strong>
+          </button>
+        )}
+      </div>
+
+      <button
+        onClick={() => (status.configured ? onConnect(platform) : onShowSetup())}
+        className={`w-full py-3 rounded-xl ${buttonCls} text-white font-bold text-xs shadow-md transition flex items-center justify-center space-x-2`}
+      >
+        <span className="text-sm">{icon}</span>
+        <span>{connected ? 'Yeniden Bağla / Hesap Ekle' : `${title.split(' ')[0]} Bağla`}</span>
+      </button>
+    </div>
+  );
+}
+
 export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const [activeModal, setActiveModal] = useState(null); // 'telegram' | 'twitter' | null
   const [twTab, setTwTab] = useState('auto_login'); // 'auto_login' (Default & Easy) | 'auth_token' | 'api_keys'
@@ -37,6 +108,43 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
   const [tgPwError,   setTgPwError]   = useState('');
   const [tgPwSending, setTgPwSending] = useState(false);
   const pollRef = useRef(null);
+
+  // ── Meta (Instagram / Facebook) State ──
+  const [metaStatus, setMetaStatus] = useState({ configured: false, accounts: [] });
+
+  const loadMetaStatus = () =>
+    fetch('/api/meta/status').then(r => r.json()).then(setMetaStatus).catch(() => {});
+
+  useEffect(() => { loadMetaStatus(); }, []);
+
+  // OAuth ayrı pencerede yürüyor; kapandığında listeyi tazeliyoruz.
+  const connectMeta = async (platform) => {
+    try {
+      const res = await fetch(`/api/${platform}/auth-url`);
+      const data = await res.json();
+      if (!data.success) {
+        onShowToast(data.error, 'error');
+        setActiveModal('meta-setup');
+        return;
+      }
+      const win = window.open(data.url, 'meta-oauth', 'width=600,height=760');
+      const timer = setInterval(() => {
+        if (win?.closed) {
+          clearInterval(timer);
+          loadMetaStatus();
+          onShowToast('Bağlantı durumu güncellendi.', 'info');
+        }
+      }, 1000);
+    } catch (e) {
+      onShowToast(e.message, 'error');
+    }
+  };
+
+  const removeMetaAccount = async (id) => {
+    await fetch(`/api/meta/accounts/${id}`, { method: 'DELETE' }).catch(() => {});
+    loadMetaStatus();
+    onShowToast('Hesap kaldırıldı.', 'info');
+  };
 
   useEffect(() => {
     return () => clearInterval(pollRef.current);
@@ -418,7 +526,114 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           </button>
         </div>
 
+        {/* 3. INSTAGRAM CARD */}
+        <MetaCard
+          platform="instagram"
+          icon="📸"
+          title="Instagram Hesabı"
+          subtitle="Gönderi, Hikâye ve Reels paylaş"
+          gradient="bg-gradient-to-br from-fuchsia-600 to-amber-500"
+          buttonCls="bg-fuchsia-600 hover:bg-fuchsia-500"
+          status={metaStatus}
+          accounts={metaStatus.accounts?.filter(a => a.platform === 'instagram') || []}
+          onConnect={connectMeta}
+          onRemove={removeMetaAccount}
+          onShowSetup={() => setActiveModal('meta-setup')}
+          emptyText="Instagram hesabını bağlayarak gönderi, hikâye ve Reels paylaş; yorumları kapat, gizle veya yanıtla. Hesabın Profesyonel (İşletme/Kreatör) olmalı."
+        />
+
+        {/* 4. FACEBOOK CARD */}
+        <MetaCard
+          platform="facebook"
+          icon="📘"
+          title="Facebook Sayfası"
+          subtitle="Sayfana gönderi, Hikâye ve Reels"
+          gradient="bg-gradient-to-br from-blue-600 to-sky-500"
+          buttonCls="bg-blue-600 hover:bg-blue-500"
+          status={metaStatus}
+          accounts={metaStatus.accounts?.filter(a => a.platform === 'facebook') || []}
+          onConnect={connectMeta}
+          onRemove={removeMetaAccount}
+          onShowSetup={() => setActiveModal('meta-setup')}
+          emptyText="Facebook Sayfanı bağla. Meta kişisel profile API ile paylaşıma izin vermiyor, bu yüzden bir Sayfa gerekiyor."
+        />
+
       </div>
+
+      {/* META KURULUM REHBERİ */}
+      {activeModal === 'meta-setup' && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+          <div className="w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl p-6 my-8 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-white text-base">📸📘 Instagram & Facebook Kurulumu</h3>
+              <button onClick={() => setActiveModal(null)} className="text-slate-400 hover:text-white text-sm font-bold">✕</button>
+            </div>
+
+            <div className="p-3 rounded-xl bg-sky-950/40 border border-sky-500/30 text-xs text-sky-200">
+              Bu tek seferlik bir kurulum. Bittiğinde Instagram ve Facebook, Telegram/X ile aynı
+              kurallarda kullanılabilir hâle gelir. Ücretsizdir.
+            </div>
+
+            <ol className="space-y-3 text-xs text-slate-300">
+              {[
+                ['Instagram hesabını Profesyonel yap',
+                 'Instagram uygulaması → Ayarlar → Hesap türü → "Profesyonel hesaba geç" (İşletme ya da Kreatör). Ücretsiz ve istediğin zaman geri alınabilir. Instagram, API ile paylaşımı yalnızca profesyonel hesaplara açıyor.'],
+                ['Meta geliştirici uygulaması oluştur',
+                 'developers.facebook.com/apps → "Uygulama oluştur". Facebook Sayfası da bağlayacaksan ürün olarak "Facebook Login", Instagram için "Instagram" ürününü ekle.'],
+                ['Yönlendirme adreslerini ekle',
+                 'Uygulama ayarlarında geçerli OAuth yönlendirme adresi olarak aşağıdaki iki adresi ekle. Birebir aynı olmalı.'],
+                ['Kimlik bilgilerini Render\'a gir',
+                 'Render → servisin → Environment sekmesi. META_APP_ID ve META_APP_SECRET değişkenlerini uygulamanın kimlik bilgileriyle ekle. PUBLIC_URL zaten Render tarafından ayarlanıyor; ayarlı değilse uygulamanın adresini ekle.'],
+                ['Bağlan',
+                 'Render yeniden dağıttıktan sonra bu sayfaya dön ve "Instagram Bağla" / "Facebook Bağla" düğmesine bas.'],
+              ].map(([head, body], i) => (
+                <li key={i} className="flex gap-3">
+                  <span className="shrink-0 w-6 h-6 rounded-full bg-indigo-600 text-white font-bold flex items-center justify-center text-[11px]">{i + 1}</span>
+                  <div>
+                    <p className="font-bold text-white">{head}</p>
+                    <p className="text-slate-400 leading-relaxed">{body}</p>
+                  </div>
+                </li>
+              ))}
+            </ol>
+
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-700 space-y-2">
+              <p className="text-[11px] font-bold text-slate-300">Yönlendirme adreslerin:</p>
+              {metaStatus.publicUrl ? (
+                <>
+                  <code className="block text-[11px] text-emerald-300 font-mono break-all">{metaStatus.redirectUris?.instagram}</code>
+                  <code className="block text-[11px] text-emerald-300 font-mono break-all">{metaStatus.redirectUris?.facebook}</code>
+                </>
+              ) : (
+                <p className="text-[11px] text-amber-300">
+                  PUBLIC_URL ayarlı değil, adresleri gösteremiyorum. Render ortam değişkenlerine
+                  uygulamanın genel adresini ekle (örn. https://uygulamam.onrender.com).
+                </p>
+              )}
+            </div>
+
+            <div className="p-3 rounded-xl bg-amber-950/30 border border-amber-500/20 text-[11px] text-amber-200/90 space-y-1">
+              <p className="font-bold">Bilmen gerekenler</p>
+              <p>• <strong>Beğeni gizleme</strong> API'de yok — ne resmî ne gayriresmî yolla otomatikleştirilemiyor, yalnızca uygulama içinden elle yapılıyor.</p>
+              <p>• Instagram salt metin gönderiyi desteklemiyor; görsel veya video gerekiyor.</p>
+              <p>• Facebook kişisel profiline API ile paylaşım yapılamıyor, bir Sayfa gerekiyor.</p>
+              <p>• Başkasının Instagram hesabını okumak yalnızca herkese açık İşletme/Kreatör hesapları için mümkün.</p>
+              <p>• Instagram günde en fazla 100 API paylaşımına izin veriyor.</p>
+            </div>
+
+            <div className="flex gap-3">
+              <a href="https://developers.facebook.com/apps" target="_blank" rel="noreferrer"
+                className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs text-center">
+                Meta Geliştirici Paneli ↗
+              </a>
+              <button onClick={() => { loadMetaStatus(); setActiveModal(null); }}
+                className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-bold text-xs">
+                Kapat ve Yenile
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* TELEGRAM MODAL */}
       {activeModal === 'telegram' && (

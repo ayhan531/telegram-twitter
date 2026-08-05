@@ -4,43 +4,179 @@ import {
   SlidersHorizontal, X, Play, Pause, Send, Loader2, Info
 } from 'lucide-react';
 
+const PLATFORM_META = {
+  telegram:  { icon: '✈️', label: 'Telegram' },
+  twitter:   { icon: '𝕏',  label: 'X (Twitter)' },
+  instagram: { icon: '📸', label: 'Instagram' },
+  facebook:  { icon: '📘', label: 'Facebook' },
+};
+
+const REPLY_LABELS = {
+  following: '👥 Takip ettiklerin yanıtlar',
+  mentioned: '📣 Bahsettiklerin yanıtlar',
+  verified:  '✅ Onaylılar yanıtlar',
+};
+
+const IG_KIND_LABELS = { post: '🖼️ Gönderi', story: '⏳ Hikâye', reel: '🎬 Reels' };
+
+// Kurallar hem eski (yalnızca Twitter) hem yeni biçimde olabiliyor; ikisini de
+// aynı özet satırına indiriyoruz.
+function describeTargets(rule) {
+  const targets = rule.targets?.length
+    ? rule.targets
+    : (rule.targetAccounts || []).map(a => ({
+        platform: 'twitter', name: a.name, options: { replyMode: rule.replyMode },
+      }));
+
+  return targets.map(t => {
+    const meta = PLATFORM_META[t.platform] || { icon: '•', label: t.platform };
+    let detail = t.name || '';
+    if (t.platform === 'twitter') {
+      detail = REPLY_LABELS[t.options?.replyMode] || '🌍 Herkes yanıtlar';
+    } else if (t.platform === 'telegram') {
+      detail = t.chatId || '—';
+    } else if (t.platform === 'instagram') {
+      detail = `${IG_KIND_LABELS[t.options?.kind] || '🖼️ Gönderi'}${t.options?.disableComments ? ' · 🔇' : ''}`;
+    } else if (t.platform === 'facebook') {
+      detail = IG_KIND_LABELS[t.options?.kind] || '🖼️ Gönderi';
+    }
+    return { icon: meta.icon, title: t.name || meta.label, detail };
+  });
+}
+
+const inputCls = 'w-full px-3 py-2 rounded-xl glass-input text-white text-xs';
+const selectCls = 'w-full px-3 py-2 rounded-xl glass-input text-white text-xs bg-slate-800 border border-slate-700';
+
+function PlatformPicker({ value, onChange, disabledSet }) {
+  return (
+    <div className="grid grid-cols-4 gap-2">
+      {Object.entries(PLATFORM_META).map(([key, p]) => {
+        const off = disabledSet?.has(key);
+        return (
+          <button
+            key={key}
+            type="button"
+            disabled={off}
+            onClick={() => onChange(key)}
+            className={`py-2 rounded-xl border text-[11px] font-bold transition ${
+              value === key
+                ? 'bg-indigo-600 border-indigo-400 text-white'
+                : off
+                  ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed'
+                  : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+            }`}
+          >
+            <div className="text-base leading-tight">{p.icon}</div>
+            {p.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function RuleForm({ accounts, initial, onSave, onCancel }) {
   const telegramAccounts = accounts.filter(a => a.platform === 'telegram');
   const twitterAccounts  = accounts.filter(a => a.platform === 'twitter');
 
+  // Instagram/Facebook hesapları sunucuda tutuluyor (jetonlar tarayıcıya
+  // hiç inmiyor), bu yüzden onları ayrıca çekiyoruz.
+  const [metaAccounts, setMetaAccounts] = useState([]);
+  useEffect(() => {
+    fetch('/api/meta/status')
+      .then(r => r.json())
+      .then(d => setMetaAccounts(d.accounts || []))
+      .catch(() => {});
+  }, []);
+
+  const igAccounts = metaAccounts.filter(a => a.platform === 'instagram');
+  const fbAccounts = metaAccounts.filter(a => a.platform === 'facebook');
+
   const [form, setForm] = useState(initial || {
-    title: 'Oto-Tweet Kuralı',
+    title: 'Yeni Paylaşım Kuralı',
+    sourcePlatform: 'telegram',
     sourceAccountId: telegramAccounts[0]?.credentials?.accountId || telegramAccounts[0]?.id || '',
-    sourceChannelId: '', // @kanaladi, -100... or empty for all
-    sourceSenderId: '',  // @kullaniciadi veya kimlik; boş = kanaldaki herkes
+    sourceChannelId: '',
+    sourceSenderId: '',
+    sourceHandle: '',
+    sourcePageId: '',
+    skipRetweets: true,
+    skipReplies: true,
     replyMode: 'everyone',
-    targetIds: twitterAccounts.map(a => a.id),
+    targets: [],
     autoHashtags: '',
     bannedKeywords: '',
     enabled: true,
   });
 
+  const [preview, setPreview] = useState(null);
+  const [previewing, setPreviewing] = useState(false);
+
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
 
-  const handleSave = () => {
-    if (!form.sourceAccountId && telegramAccounts.length > 0) {
-      form.sourceAccountId = telegramAccounts[0]?.credentials?.accountId || telegramAccounts[0]?.id;
+  const addTarget = (platform) => {
+    const base = { platform, options: {} };
+    if (platform === 'twitter') {
+      const a = twitterAccounts[0];
+      if (!a) return alert('Önce X hesabı bağlamalısın (Bağlantılar sekmesi).');
+      Object.assign(base, { name: a.name, accountId: a.id, credentials: a.credentials, options: { replyMode: 'everyone' } });
+    } else if (platform === 'telegram') {
+      const a = telegramAccounts[0];
+      if (!a) return alert('Önce Telegram hesabı bağlamalısın.');
+      Object.assign(base, { name: a.name, accountId: a.credentials?.accountId || a.id, chatId: '' });
+    } else if (platform === 'instagram') {
+      const a = igAccounts[0];
+      if (!a) return alert('Önce Instagram hesabı bağlamalısın.');
+      Object.assign(base, { name: `@${a.username}`, accountId: a.id, options: { kind: 'post', disableComments: false } });
+    } else if (platform === 'facebook') {
+      const a = fbAccounts[0];
+      if (!a) return alert('Önce Facebook hesabı bağlamalısın.');
+      Object.assign(base, { name: a.pages?.[0]?.name || a.name, accountId: a.id, pageId: a.pages?.[0]?.id, options: { kind: 'post', commentControl: 'EVERYONE' } });
     }
-    if (!form.sourceAccountId) {
-      alert('Lütfen önce Telegram hesabınızı bağlayın.');
-      return;
-    }
-    if (twitterAccounts.length === 0) {
-      alert('Lütfen hedef olarak Twitter hesabı bağlayın.');
-      return;
-    }
+    set('targets', [...(form.targets || []), base]);
+  };
 
-    const selectedTwitter = twitterAccounts.filter(a => form.targetIds.includes(a.id));
-    onSave({
-      ...form,
-      id: initial?.id || `rule-${Date.now()}`,
-      targetAccounts: selectedTwitter.length > 0 ? selectedTwitter : twitterAccounts,
-    });
+  const updateTarget = (i, patch) => {
+    const next = [...form.targets];
+    next[i] = { ...next[i], ...patch, options: { ...next[i].options, ...(patch.options || {}) } };
+    set('targets', next);
+  };
+
+  const removeTarget = (i) => set('targets', form.targets.filter((_, j) => j !== i));
+
+  const runPreview = async () => {
+    setPreviewing(true);
+    setPreview(null);
+    try {
+      const r = await fetch('/api/source/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform: form.sourcePlatform, handle: form.sourceHandle }),
+      });
+      setPreview(await r.json());
+    } catch (e) {
+      setPreview({ success: false, error: e.message });
+    }
+    setPreviewing(false);
+  };
+
+  const handleSave = () => {
+    if (form.sourcePlatform === 'telegram' && !form.sourceAccountId) {
+      return alert('Önce Telegram hesabını bağla.');
+    }
+    if (form.sourcePlatform === 'twitter' && !form.sourceHandle.trim()) {
+      return alert('Çekilecek X hesabını gir (örn: @nasa).');
+    }
+    if ((form.sourcePlatform === 'instagram' || form.sourcePlatform === 'facebook') && !form.sourceAccountId) {
+      return alert(`Önce ${PLATFORM_META[form.sourcePlatform].label} hesabını bağla.`);
+    }
+    if (!form.targets?.length) {
+      return alert('En az bir hedef ekle.');
+    }
+    const badTg = form.targets.find(t => t.platform === 'telegram' && !t.chatId?.trim());
+    if (badTg) return alert('Telegram hedefi için kanal/grup adresi gir (örn: @kanalim).');
+
+    onSave({ ...form, id: initial?.id || `rule-${Date.now()}` });
   };
 
   return (
@@ -48,77 +184,226 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
       <div>
         <label className="text-[11px] font-bold text-slate-300 block mb-1">Kural Adı</label>
         <input type="text" value={form.title} onChange={e => set('title', e.target.value)}
-          placeholder="Örn: Kripto Haber Oto-Tweet"
-          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
+          placeholder="Örn: Kripto Haber → X + Instagram"
+          className={inputCls} />
       </div>
 
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1">📥 Kaynak: Telegram Hesabı</label>
-        {telegramAccounts.length === 0 ? (
-          <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
-            Önce Telegram hesabı bağlamalısın (Bağlantılar sekmesi).
+      {/* ── KAYNAK ────────────────────────────────────────────── */}
+      <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-700 space-y-3">
+        <label className="text-[11px] font-bold text-sky-300 block">📥 KAYNAK — nereden çekilecek?</label>
+        <PlatformPicker value={form.sourcePlatform} onChange={v => { set('sourcePlatform', v); setPreview(null); }} />
+
+        {form.sourcePlatform === 'telegram' && (
+          <>
+            {telegramAccounts.length === 0 ? (
+              <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
+                Önce Telegram hesabı bağlamalısın (Bağlantılar sekmesi).
+              </div>
+            ) : (
+              <select value={form.sourceAccountId} onChange={e => set('sourceAccountId', e.target.value)} className={selectCls}>
+                {telegramAccounts.map(a => (
+                  <option key={a.id} value={a.credentials?.accountId || a.id}>✈️ {a.name} ({a.username})</option>
+                ))}
+              </select>
+            )}
+            <div>
+              <p className="text-[10px] text-slate-400 mb-1">
+                Kanal/grup: <code className="text-sky-400">@btchaber</code>, <code className="text-sky-400">-1001234567890</code> veya
+                {' '}<code className="text-sky-400">t.me/...</code>. <strong>Boş = tüm sohbetler.</strong>
+              </p>
+              <input type="text" value={form.sourceChannelId} onChange={e => set('sourceChannelId', e.target.value)}
+                placeholder="@kanaladi (Boş = hepsi)" className={inputCls + ' font-mono'} />
+            </div>
+            <div>
+              <p className="text-[10px] text-slate-400 mb-1">
+                👤 Yalnızca bu kişi (isteğe bağlı). Kanallarda gönderiler kanalın kendisine ait olduğu için bu asıl <strong>gruplarda</strong> işe yarar.
+              </p>
+              <input type="text" value={form.sourceSenderId} onChange={e => set('sourceSenderId', e.target.value)}
+                placeholder="@kullaniciadi (Boş = herkes)" className={inputCls + ' font-mono'} />
+            </div>
+          </>
+        )}
+
+        {form.sourcePlatform === 'twitter' && (
+          <>
+            <p className="text-[10px] text-slate-400">
+              Herkese açık <strong>herhangi bir</strong> X hesabı. Kendi hesabın olması gerekmez, linkini yapıştırman yeterli.
+            </p>
+            <input type="text" value={form.sourceHandle} onChange={e => set('sourceHandle', e.target.value)}
+              placeholder="@nasa veya https://x.com/nasa" className={inputCls + ' font-mono'} />
+            <div className="flex gap-3 text-[11px] text-slate-300">
+              <label className="flex items-center gap-1.5">
+                <input type="checkbox" checked={!!form.skipRetweets} onChange={e => set('skipRetweets', e.target.checked)} />
+                Retweetleri atla
+              </label>
+              <label className="flex items-center gap-1.5">
+                <input type="checkbox" checked={!!form.skipReplies} onChange={e => set('skipReplies', e.target.checked)} />
+                Yanıtları atla
+              </label>
+            </div>
+            <button type="button" onClick={runPreview} disabled={previewing || !form.sourceHandle.trim()}
+              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-bold text-white disabled:opacity-40">
+              {previewing ? 'Deneniyor...' : '🔍 Bu hesabı okuyabiliyor muyuz?'}
+            </button>
+          </>
+        )}
+
+        {form.sourcePlatform === 'instagram' && (
+          <>
+            {igAccounts.length === 0 ? (
+              <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
+                Önce Instagram hesabı bağlamalısın (Bağlantılar sekmesi).
+              </div>
+            ) : (
+              <select value={form.sourceAccountId} onChange={e => set('sourceAccountId', e.target.value)} className={selectCls}>
+                {igAccounts.map(a => <option key={a.id} value={a.id}>📸 @{a.username}</option>)}
+              </select>
+            )}
+            <div>
+              <p className="text-[10px] text-slate-400 mb-1">
+                Başka bir hesabı çekmek istersen adını yaz. <strong>Boş = kendi gönderilerin.</strong> Instagram
+                başkalarının hesabını okumaya yalnızca herkese açık <strong>İşletme/Kreatör</strong> hesapları için izin veriyor.
+              </p>
+              <input type="text" value={form.sourceHandle} onChange={e => set('sourceHandle', e.target.value)}
+                placeholder="@baskahesap (Boş = kendi hesabın)" className={inputCls + ' font-mono'} />
+            </div>
+          </>
+        )}
+
+        {form.sourcePlatform === 'facebook' && (
+          <>
+            {fbAccounts.length === 0 ? (
+              <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
+                Önce Facebook hesabı bağlamalısın (Bağlantılar sekmesi).
+              </div>
+            ) : (
+              <>
+                <select value={form.sourceAccountId} onChange={e => set('sourceAccountId', e.target.value)} className={selectCls}>
+                  {fbAccounts.map(a => <option key={a.id} value={a.id}>📘 {a.name}</option>)}
+                </select>
+                <select value={form.sourcePageId} onChange={e => set('sourcePageId', e.target.value)} className={selectCls}>
+                  {(fbAccounts.find(a => a.id === form.sourceAccountId)?.pages || fbAccounts[0]?.pages || []).map(p => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </>
+            )}
+          </>
+        )}
+
+        {preview && (
+          <div className={`p-2.5 rounded-lg text-[11px] border ${preview.success
+            ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-200'
+            : 'bg-rose-950/40 border-rose-500/30 text-rose-200'}`}>
+            {preview.success
+              ? <>✅ {preview.author} okunabiliyor — {preview.count} gönderi bulundu. En yenisi: “{preview.items?.[0]?.text?.slice(0, 70) || '(metinsiz)'}”</>
+              : <>❌ {preview.error}</>}
           </div>
-        ) : (
-          <select value={form.sourceAccountId} onChange={e => set('sourceAccountId', e.target.value)}
-            className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs bg-slate-800 border border-slate-700">
-            {telegramAccounts.map(a => (
-              <option key={a.id} value={a.credentials?.accountId || a.id}>
-                ✈️ {a.name} ({a.username})
-              </option>
-            ))}
-          </select>
         )}
       </div>
 
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">📡 Kaynak: Kanal, Grup veya Sohbet</label>
-        <p className="text-[10px] text-slate-400 mb-1.5">
-          Kanal/Grup kullanıcı adı (örn: <code className="text-sky-400">@btchaber</code>) veya ID numarası (örn: <code className="text-sky-400">-1001234567890</code>).
-          <strong> Boş bırakırsan gelen TÜM mesajlar tweet atılır.</strong>
-        </p>
-        <input type="text" value={form.sourceChannelId} onChange={e => set('sourceChannelId', e.target.value)}
-          placeholder="@kanaladi veya -1001234567890 (Boş = Tüm mesajlar)"
-          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
-      </div>
+      {/* ── HEDEFLER ──────────────────────────────────────────── */}
+      <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-700 space-y-3">
+        <div className="flex items-center justify-between">
+          <label className="text-[11px] font-bold text-emerald-300">📤 HEDEFLER — nereye gönderilecek?</label>
+          <span className="text-[10px] text-slate-500">{form.targets?.length || 0} hedef</span>
+        </div>
 
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">👤 Yalnızca Bu Kişinin Mesajları (İsteğe Bağlı)</label>
-        <p className="text-[10px] text-slate-400 mb-1.5">
-          Kullanıcı adı (örn: <code className="text-sky-400">@ahmet</code>) veya sayısal kimlik.
-          <strong> Boş bırakırsan kanaldaki herkesin mesajı tweet atılır.</strong> Kanallarda
-          gönderiler kanalın kendisine ait olduğu için bu alan asıl gruplarda işe yarar.
-        </p>
-        <input type="text" value={form.sourceSenderId} onChange={e => set('sourceSenderId', e.target.value)}
-          placeholder="@kullaniciadi (Boş = Herkes)"
-          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs font-mono" />
-      </div>
+        <div className="grid grid-cols-4 gap-2">
+          {Object.entries(PLATFORM_META).map(([key, p]) => (
+            <button key={key} type="button" onClick={() => addTarget(key)}
+              className="py-2 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 text-[11px] font-bold text-slate-200">
+              <div className="text-base leading-tight">{p.icon}</div>
+              + {p.label}
+            </button>
+          ))}
+        </div>
 
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">💬 Tweet'e Kimler Yanıt Verebilir?</label>
-        <p className="text-[10px] text-slate-400 mb-1.5">X'te tweet atarken seçtiğin ayarın aynısı, otomatik uygulanır.</p>
-        <select value={form.replyMode} onChange={e => set('replyMode', e.target.value)}
-          className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs bg-slate-800 border border-slate-700">
-          <option value="everyone">🌍 Herkes</option>
-          <option value="following">👥 Takip ettiğin hesaplar</option>
-          <option value="mentioned">📣 Yalnızca bahsettiğin hesaplar</option>
-          <option value="verified">✅ Onaylanmış hesaplar</option>
-        </select>
-      </div>
-
-      <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-1">📤 Hedef Twitter Hesabı</label>
-        {twitterAccounts.length === 0 ? (
-          <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-xs text-amber-200">
-            Önce Twitter hesabı bağlamalısın (Bağlantılar sekmesi).
-          </div>
-        ) : (
-          <div className="p-3 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
-            <div className="flex items-center space-x-2">
-              <span className="text-sm">𝕏</span>
-              <span className="text-xs font-bold text-white">{twitterAccounts[0].name} ({twitterAccounts[0].username})</span>
+        {(form.targets || []).map((t, i) => (
+          <div key={i} className="p-2.5 rounded-xl bg-slate-800/80 border border-slate-700 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-white">
+                {PLATFORM_META[t.platform].icon} {PLATFORM_META[t.platform].label} — {t.name}
+              </span>
+              <button type="button" onClick={() => removeTarget(i)} className="text-rose-400 hover:text-rose-300">
+                <Trash2 size={13} />
+              </button>
             </div>
-            <CheckCircle2 size={16} className="text-emerald-400" />
+
+            {t.platform === 'twitter' && (
+              <select value={t.options.replyMode} onChange={e => updateTarget(i, { options: { replyMode: e.target.value } })} className={selectCls}>
+                <option value="everyone">💬 Yanıtlar: Herkes</option>
+                <option value="following">👥 Yanıtlar: Takip ettiklerin</option>
+                <option value="mentioned">📣 Yanıtlar: Yalnızca bahsettiklerin</option>
+                <option value="verified">✅ Yanıtlar: Onaylanmış hesaplar</option>
+              </select>
+            )}
+
+            {t.platform === 'telegram' && (
+              <>
+                <select value={t.accountId} onChange={e => updateTarget(i, { accountId: e.target.value })} className={selectCls}>
+                  {telegramAccounts.map(a => (
+                    <option key={a.id} value={a.credentials?.accountId || a.id}>{a.name}</option>
+                  ))}
+                </select>
+                <input type="text" value={t.chatId || ''} onChange={e => updateTarget(i, { chatId: e.target.value })}
+                  placeholder="@kanalim veya -1001234567890" className={inputCls + ' font-mono'} />
+                <p className="text-[10px] text-slate-500">Bu kanalda yönetici olman gerekiyor.</p>
+              </>
+            )}
+
+            {t.platform === 'instagram' && (
+              <>
+                <select value={t.accountId} onChange={e => {
+                  const a = igAccounts.find(x => x.id === e.target.value);
+                  updateTarget(i, { accountId: e.target.value, name: `@${a?.username || ''}` });
+                }} className={selectCls}>
+                  {igAccounts.map(a => <option key={a.id} value={a.id}>@{a.username}</option>)}
+                </select>
+                <select value={t.options.kind} onChange={e => updateTarget(i, { options: { kind: e.target.value } })} className={selectCls}>
+                  <option value="post">🖼️ Gönderi (foto/video/karusel)</option>
+                  <option value="story">⏳ Hikâye</option>
+                  <option value="reel">🎬 Reels (yalnızca video)</option>
+                </select>
+                <label className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                  <input type="checkbox" checked={!!t.options.disableComments}
+                    onChange={e => updateTarget(i, { options: { disableComments: e.target.checked } })} />
+                  🔇 Yorumları kapat
+                </label>
+              </>
+            )}
+
+            {t.platform === 'facebook' && (
+              <>
+                <select value={t.pageId} onChange={e => {
+                  const acc = fbAccounts.find(x => x.id === t.accountId) || fbAccounts[0];
+                  const pg = acc?.pages?.find(p => p.id === e.target.value);
+                  updateTarget(i, { pageId: e.target.value, name: pg?.name });
+                }} className={selectCls}>
+                  {(fbAccounts.find(a => a.id === t.accountId)?.pages || []).map(p => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+                <select value={t.options.kind} onChange={e => updateTarget(i, { options: { kind: e.target.value } })} className={selectCls}>
+                  <option value="post">🖼️ Gönderi</option>
+                  <option value="story">⏳ Hikâye (yalnızca görsel)</option>
+                  <option value="reel">🎬 Reels (yalnızca video)</option>
+                </select>
+                <select value={t.options.commentControl} onChange={e => updateTarget(i, { options: { commentControl: e.target.value } })} className={selectCls}>
+                  <option value="EVERYONE">💬 Yorumlar: Herkes</option>
+                  <option value="PEOPLE_AND_PAGES_YOU_FOLLOW">👥 Yorumlar: Takip ettiklerin</option>
+                  <option value="FOLLOWERS_AND_MENTIONED">📣 Yorumlar: Takipçiler ve bahsedilenler</option>
+                  <option value="MENTIONED_ONLY">🔒 Yorumlar: Yalnızca bahsedilenler</option>
+                </select>
+              </>
+            )}
           </div>
+        ))}
+
+        {!form.targets?.length && (
+          <p className="text-[11px] text-slate-500 text-center py-2">
+            Henüz hedef yok. Yukarıdan bir platform seç — birden fazla ekleyebilirsin.
+          </p>
         )}
       </div>
 
@@ -305,10 +590,14 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
                   {/* Flow Visualization */}
                   <div className="flex items-center space-x-2 flex-wrap gap-y-2">
                     <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-sky-900/30 border border-sky-500/20">
-                      <span className="text-sm">✈️</span>
+                      <span className="text-sm">{PLATFORM_META[rule.sourcePlatform || 'telegram'].icon}</span>
                       <div>
-                        <p className="text-[11px] font-semibold text-sky-300">Telegram</p>
-                        <p className="text-[9px] text-slate-400 font-mono">{rule.sourceChannelId || 'Tüm Mesajlar'}</p>
+                        <p className="text-[11px] font-semibold text-sky-300">
+                          {PLATFORM_META[rule.sourcePlatform || 'telegram'].label}
+                        </p>
+                        <p className="text-[9px] text-slate-400 font-mono">
+                          {rule.sourceHandle || rule.sourceChannelId || 'Tüm Mesajlar'}
+                        </p>
                         {rule.sourceSenderId && (
                           <p className="text-[9px] text-amber-300/80 font-mono">👤 {rule.sourceSenderId}</p>
                         )}
@@ -317,19 +606,15 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
 
                     <ArrowRight size={14} className="text-slate-500 shrink-0" />
 
-                    <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-indigo-900/30 border border-indigo-500/20">
-                      <span className="text-sm">𝕏</span>
-                      <div>
-                        <p className="text-[11px] text-indigo-300 font-semibold">Twitter</p>
-                        <p className="text-[9px] text-slate-400">
-                          {{
-                            following: '👥 Takip ettiklerin yanıtlar',
-                            mentioned: '📣 Bahsettiklerin yanıtlar',
-                            verified:  '✅ Onaylılar yanıtlar',
-                          }[rule.replyMode] || '🌍 Herkes yanıtlar'}
-                        </p>
+                    {describeTargets(rule).map((t, i) => (
+                      <div key={i} className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-indigo-900/30 border border-indigo-500/20">
+                        <span className="text-sm">{t.icon}</span>
+                        <div>
+                          <p className="text-[11px] text-indigo-300 font-semibold">{t.title}</p>
+                          <p className="text-[9px] text-slate-400">{t.detail}</p>
+                        </div>
                       </div>
-                    </div>
+                    ))}
                   </div>
 
                   {/* Filters */}

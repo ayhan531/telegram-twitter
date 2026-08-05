@@ -188,12 +188,26 @@ app.get('/api/config', async (_req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 const TEMP_MEDIA_TTL_MS = 30 * 60 * 1000;
 
+// Bu uç kendi alan adımızdan içerik sunuyor. Tür serbest bırakılırsa
+// text/html yükleyip sitemizin üstünde betik çalıştırmak mümkün olurdu,
+// bu yüzden yalnızca bu listedekilere izin veriyoruz.
+const ALLOWED_MEDIA_TYPES = new Map([
+  ['image/jpeg', 'jpg'],
+  ['image/png',  'png'],
+  ['image/gif',  'gif'],
+  ['image/webp', 'webp'],
+  ['video/mp4',  'mp4'],
+]);
+
 function publishTempMedia(buffer, mediaType) {
   if (!PUBLIC_BASE_URL) {
     throw new Error('PUBLIC_URL ayarlı değil. Instagram/Facebook medya paylaşımı için sunucunun genel adresi gerekiyor.');
   }
+  const ext = ALLOWED_MEDIA_TYPES.get(mediaType);
+  if (!ext) {
+    throw new Error(`Desteklenmeyen medya türü: ${mediaType}. İzin verilenler: ${[...ALLOWED_MEDIA_TYPES.keys()].join(', ')}`);
+  }
   const token = crypto.randomBytes(24).toString('hex');
-  const ext = mediaType.startsWith('video/') ? 'mp4' : (mediaType === 'image/png' ? 'png' : 'jpg');
   tempMedia.set(token, { buffer, mediaType, expiresAt: Date.now() + TEMP_MEDIA_TTL_MS });
   return { token, url: `${PUBLIC_BASE_URL}/media/${token}.${ext}` };
 }
@@ -215,15 +229,23 @@ function postToPublicUrls(post) {
 }
 
 app.get('/media/:file', (req, res) => {
-  const token = String(req.params.file).replace(/\.(jpg|png|mp4)$/i, '');
+  const token = String(req.params.file).replace(/\.[a-z0-9]+$/i, '');
   const entry = tempMedia.get(token);
   if (!entry || Date.now() > entry.expiresAt) {
     tempMedia.delete(token);
     return res.status(404).send('Not found');
   }
+  // Türü kayıttan değil izin listesinden alıyoruz: depolanan değer bozulsa
+  // bile tarayıcıya asla çalıştırılabilir bir tür gönderilmesin.
+  if (!ALLOWED_MEDIA_TYPES.has(entry.mediaType)) {
+    tempMedia.delete(token);
+    return res.status(415).send('Unsupported media type');
+  }
   res.set('Content-Type', entry.mediaType);
   res.set('Content-Length', String(entry.buffer.length));
   res.set('Cache-Control', 'no-store');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Content-Security-Policy', "default-src 'none'; sandbox");
   return res.send(entry.buffer);
 });
 
@@ -536,12 +558,20 @@ app.get('/api/:platform(instagram|facebook)/callback', async (req, res) => {
   const platform = req.params.platform;
   const { code, state, error_description: errDesc } = req.query;
 
+  // Buraya gelen metin kullanıcıdan (sorgu dizesi) ve Meta'dan geliyor;
+  // doğrudan HTML'e gömersek yansıtılmış XSS olur.
+  const esc = (s) => String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
   const finish = (ok, message) =>
-    res.send(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+    res
+      .set('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'")
+      .set('X-Content-Type-Options', 'nosniff')
+      .send(`<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
 <div style="text-align:center;max-width:420px;padding:24px">
 <div style="font-size:44px">${ok ? '✅' : '❌'}</div>
 <h2 style="margin:12px 0">${ok ? 'Hesap bağlandı' : 'Bağlanamadı'}</h2>
-<p style="color:#94a3b8;font-size:14px">${message}</p>
+<p style="color:#94a3b8;font-size:14px">${esc(message)}</p>
 <p style="color:#64748b;font-size:12px">Bu pencereyi kapatabilirsin.</p>
 </div><script>setTimeout(()=>window.close(),${ok ? 2500 : 8000})</script></body>`);
 
