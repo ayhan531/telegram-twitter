@@ -27,8 +27,8 @@ services:
         value: production
       - key: PORT
         value: 3000
-      - key: DATA_DIR
-        value: /var/data
+      # DATA_DIR bilerek tanımlanmadı: uygulama /var/data diskinin gerçekten
+      # bağlı olup olmadığını kendisi kontrol edip ona göre karar veriyor.
       # Bağlantı dizesini Render otomatik dolduruyor.
       - key: DATABASE_URL
         fromDatabase:

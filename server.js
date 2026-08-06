@@ -137,10 +137,15 @@ const recentlySynced   = new Set(); // messageId -> to prevent duplicate tweets
 const syncLog          = [];        // audit trail for auto-sync activity
 
 // ─── Disk persistence ────────────────────────────────────────────────────────
-// Render'da kalıcı disk /var/data'ya bağlanıyor (render.yaml). Değişken
-// tanımlıysa o kazanır; hiçbiri yoksa yerel geliştirme klasörü kullanılır.
-const DATA_DIR = process.env.DATA_DIR
-  || (process.env.RENDER ? '/var/data' : path.join(__dirname, 'data'));
+// Kalıcı disk Render'da /var/data'ya bağlanır — ama yalnızca disk gerçekten
+// eklenmişse. Var olduğunu doğrulamadan oraya yazmaya çalışmak servisi
+// başlatılamaz hâle getiriyordu, bu yüzden önce bakıyoruz.
+function defaultDataDir() {
+  if (process.env.DATA_DIR) return process.env.DATA_DIR;
+  if (process.env.RENDER && fs.existsSync('/var/data')) return '/var/data';
+  return path.join(__dirname, 'data');
+}
+const DATA_DIR = defaultDataDir();
 
 // Ayarlar da kalıcı depoda yaşıyor; böylece Meta anahtarlarını arayüzden
 // girmek yeterli oluyor, Render ortam değişkenlerini elle düzenlemek gerekmiyor.

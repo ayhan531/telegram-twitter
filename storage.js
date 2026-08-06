@@ -14,6 +14,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 const STATE_KEY = 'app_state';
 
@@ -143,6 +144,11 @@ class FileStore {
   async init() {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.backupDir, { recursive: true, mode: 0o700 });
+    // Klasör oluşabildi diye yazılabildiği anlamına gelmiyor (salt okunur
+    // bağlanmış bir disk gibi). Gerçekten yazabildiğimizi kanıtlıyoruz.
+    const probe = path.join(this.dir, '.write-test');
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
     return this;
   }
 
@@ -247,14 +253,34 @@ export async function createStore({ databaseUrl, dataDir }) {
       console.error('[Depolama] Postgres bağlanamadı, diske düşülüyor:', e.message);
     }
   }
-  const store = await new FileStore(dataDir).init();
-  const info = store.describe();
-  if (!info.durable) {
-    console.warn('══════════════════════════════════════════════════════════════');
-    console.warn(info.detail);
-    console.warn('Render → New → Postgres oluşturup servise bağla; DATABASE_URL');
-    console.warn('otomatik gelir ve veriler kalıcı olur.');
-    console.warn('══════════════════════════════════════════════════════════════');
+  // Tercih edilen klasör kullanılamıyorsa (kalıcı disk henüz eklenmemiş,
+  // izin yok, salt okunur bağlanmış) sırayla diğerlerini deniyoruz.
+  // Depolama katmanı hiçbir koşulda uygulamayı düşürmemeli.
+  const candidates = [dataDir, '/var/data', path.join(process.cwd(), 'data'), path.join(os.tmpdir(), 'omnisync')]
+    .filter(Boolean)
+    .filter((d, i, arr) => arr.indexOf(d) === i);
+
+  const failures = [];
+  for (const dir of candidates) {
+    try {
+      const store = await new FileStore(dir).init();
+      const info = store.describe();
+      if (dir !== dataDir) {
+        console.warn(`[Depolama] ${dataDir} kullanılamadı (${failures[0] || 'bilinmeyen sebep'}), ${dir} kullanılıyor.`);
+      }
+      if (!info.durable) {
+        console.warn('══════════════════════════════════════════════════════════════');
+        console.warn(info.detail);
+        console.warn('Kalıcı hâle getirmek için Render panelinde ya:');
+        console.warn('  • Disks → Add Disk  (Mount Path: /var/data)   ya da');
+        console.warn('  • New → Postgres oluşturup servise bağla (DATABASE_URL otomatik gelir)');
+        console.warn('══════════════════════════════════════════════════════════════');
+      }
+      return store;
+    } catch (e) {
+      failures.push(`${dir}: ${e.message}`);
+    }
   }
-  return store;
+
+  throw new Error('Hiçbir yazılabilir depolama klasörü bulunamadı → ' + failures.join(' | '));
 }
