@@ -39,6 +39,7 @@ app.use(express.json({ limit: '10mb' }));
 //  hem log'da hem arayüzde uyarı verir — böylece kimse kendi uygulamasından
 //  bir anda kilitlenmez, ama korumasız olduğunu da bilmeden kalmaz.
 // ═══════════════════════════════════════════════════════════════════════════
+const BOOT_TIME = new Date().toISOString();
 const APP_PASSWORD = process.env.APP_PASSWORD || '';
 
 // Ortam değişkeni yoksa kalıcı depoda saklanan otomatik parolayı kullanıyoruz,
@@ -56,6 +57,7 @@ function activePassword() {
 // giriş yapmadan erişilmesi ZORUNLU olan uçlar listelenir.
 const OPEN_PATHS = [
   /^\/health$/,
+  /^\/version$/,
   /^\/auth\/(status|login)$/,
   /^\/(instagram|facebook)\/callback$/,
 ];
@@ -75,6 +77,23 @@ app.use('/api', (req, res, next) => {
   const supplied = req.get('x-app-password') || '';
   if (supplied && timingSafeEqual(supplied, pw)) return next();
   return res.status(401).json({ success: false, error: 'Yetkisiz. Uygulama parolası gerekli.', authRequired: true });
+});
+
+// Yüklenen paketin kimliği. Arayüz bunu düzenli kontrol edip değiştiğini
+// görürse kendini yeniliyor; böylece hangi sebeple olursa olsun (vekil
+// sunucu, mobil tarayıcı önbelleği, eski sekme) kimse eski sürümde kalmıyor.
+const BUILD_ID = (() => {
+  try {
+    const html = fs.readFileSync(path.join(__dirname, 'dist', 'index.html'), 'utf8');
+    return /assets\/index-([A-Za-z0-9_-]+)\.js/.exec(html)?.[1] || 'bilinmiyor';
+  } catch {
+    return 'bilinmiyor';
+  }
+})();
+
+app.get('/api/version', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ success: true, buildId: BUILD_ID, startedAt: BOOT_TIME });
 });
 
 app.get('/api/auth/status', (_req, res) => {
@@ -180,11 +199,20 @@ function collectState() {
   };
 }
 
+let lastSavedJson = '';
+
 async function flushState() {
   savePending = false;
   if (!store) return;
   try {
-    await store.save(collectState());
+    const state = collectState();
+    // Zaman damgası dışında hiçbir şey değişmediyse yazmıyoruz. Aksi hâlde
+    // 5 dakikalık düzenli kayıt, değişiklik olmasa bile her seferinde yeni
+    // bir yedek üretip gerçek geçmişi listeden atıyordu.
+    const fingerprint = JSON.stringify({ ...state, savedAt: undefined });
+    if (fingerprint === lastSavedJson) return;
+    await store.save(state);
+    lastSavedJson = fingerprint;
   } catch (e) {
     console.error('[Depolama] Kaydedilemedi:', e.message);
   }
@@ -2501,8 +2529,25 @@ app.get('/api/twitter/health', (_req, res) => {
 });
 
 // Serve static build from dist folder
-app.use(express.static(path.join(__dirname, 'dist')));
+// Varlık dosyalarının adında içerik özeti var, bu yüzden sonsuza kadar
+// önbelleklenebilirler. index.html ise ASLA önbelleğe alınmamalı: eski bir
+// index.html, hâlâ sunucuda duran eski paketi yükleyip kullanıcıyı eski
+// sürümde kilitliyordu (dosya silinmediği için 404 alıp kendini
+// düzeltemiyordu).
+app.use(express.static(path.join(__dirname, 'dist'), {
+  index: false,
+  setHeaders: (res, filePath) => {
+    if (/[.-][A-Za-z0-9_-]{8,}\.(js|css)$/.test(filePath)) {
+      res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    } else {
+      res.set('Cache-Control', 'no-store');
+    }
+  },
+}));
+
 app.get('*', (_req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 

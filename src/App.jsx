@@ -81,11 +81,41 @@ export default function App() {
   const [needsLogin, setNeedsLogin] = useState(false);
   const [unprotected, setUnprotected] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [loadError, setLoadError] = useState('');
 
   // Toast notification state
   const [toast, setToast] = useState({ visible: false, message: '', type: 'info' });
 
   useEffect(() => { setUnauthorizedHandler(() => setNeedsLogin(true)); }, []);
+
+  // Sürüm nöbeti: sunucudaki paket kimliği yüklediğimizden farklıysa elimizde
+  // eski bir sürüm var demektir (vekil sunucu, mobil önbellek, uzun açık kalmış
+  // sekme...). Bu durumda kendimizi bir kez yeniliyoruz — kullanıcının
+  // "eski sürüm geri geliyor" diye uğraşmasına gerek kalmıyor.
+  useEffect(() => {
+    let loadedBuild = null;
+    let stopped = false;
+
+    const check = async () => {
+      try {
+        const r = await fetch('/api/version', { cache: 'no-store' }).then(x => x.json());
+        if (stopped || !r.buildId) return;
+        if (loadedBuild === null) { loadedBuild = r.buildId; return; }
+        if (r.buildId !== loadedBuild) {
+          console.log('[Sürüm] Yeni sürüm yayında, sayfa yenileniyor.');
+          stopped = true;
+          window.location.reload();
+        }
+      } catch { /* sunucu uykuda ya da ağ yok: bir sonraki turda tekrar bak */ }
+    };
+
+    check();
+    const t = setInterval(check, 60000);
+    // Sekmeye geri dönüldüğünde de bak: en sık burada eski sürümde kalınıyor.
+    const onVisible = () => { if (document.visibilityState === 'visible') check(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { stopped = true; clearInterval(t); document.removeEventListener('visibilitychange', onVisible); };
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -117,6 +147,16 @@ export default function App() {
           fetch('/api/sync/rules').then(r => r.json()).catch(() => ({})),
           fetch('/api/config').then(r => r.json()).catch(() => ({})),
         ]);
+
+        // Sunucuya ulaşılamadığında hesap listesi boş DÖNMÜŞ gibi davranmak,
+        // her şeyin silindiği izlenimi veriyordu. Başarısız yüklemeyi ayrı
+        // bir durum olarak gösteriyoruz.
+        if (!accRes.success) {
+          setLoadError('Sunucuya ulaşılamadı. Hesapların duruyor — bağlantı gelince görünecekler.');
+          setLoaded(true);
+          return;
+        }
+        setLoadError('');
 
         let list = accRes.accounts || [];
         // Ortam değişkeniyle tanımlı Twitter hesabı varsa listeye kat.
@@ -179,6 +219,16 @@ export default function App() {
 
       {/* Sunucu korumasızsa bunu görmezden gelinemeyecek şekilde söyle:
           burada canlı X çerezleri ve Telegram oturumları duruyor. */}
+      {loadError && (
+        <div className="bg-rose-950/80 border-b border-rose-500/40 px-4 py-2 text-[11px] text-rose-200 text-center flex items-center justify-center gap-3">
+          <span>⚠️ {loadError}</span>
+          <button onClick={() => setReloadKey(k => k + 1)}
+            className="px-2 py-0.5 rounded bg-rose-800 hover:bg-rose-700 font-bold">
+            Tekrar dene
+          </button>
+        </div>
+      )}
+
       {unprotected && (
         <div className="bg-amber-950/80 border-b border-amber-500/40 px-4 py-2 text-[11px] text-amber-200 text-center">
           ⚠️ Bu uygulama parolasız açık. Adresi bilen herkes bağlı hesaplarını yönetebilir ve
