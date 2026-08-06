@@ -29,6 +29,54 @@ app.set('trust proxy', 1); // Trust Render TLS proxy
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  ERİŞİM KORUMASI
+//
+//  Bu sunucu canlı X çerezlerini ve Telegram oturum dizelerini tutuyor; bunlar
+//  ele geçirildiğinde hesapların tamamı devralınabilir. APP_PASSWORD tanımlıysa
+//  tüm yönetim uçları parola ister. Tanımlı değilse uygulama açık kalır ama
+//  hem log'da hem arayüzde uyarı verir — böylece kimse kendi uygulamasından
+//  bir anda kilitlenmez, ama korumasız olduğunu da bilmeden kalmaz.
+// ═══════════════════════════════════════════════════════════════════════════
+const APP_PASSWORD = process.env.APP_PASSWORD || '';
+
+// Meta bu adrese tarayıcı yönlendirmesiyle gelir, başlık gönderemez; state
+// parametresiyle korunuyor. Sağlık ucu ve giriş ucu da açık olmalı.
+// Dikkat: app.use('/api', ...) içinde req.path mount noktasına GÖRELİdir,
+// yani '/api/health' burada '/health' olarak görünür.
+const OPEN_PATHS = [
+  /^\/health$/,
+  /^\/auth\//,
+  /^\/(instagram|facebook)\/callback$/,
+];
+
+function timingSafeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+app.use('/api', (req, res, next) => {
+  if (!APP_PASSWORD) return next();
+  if (OPEN_PATHS.some(re => re.test(req.path))) return next();
+
+  const supplied = req.get('x-app-password') || '';
+  if (supplied && timingSafeEqual(supplied, APP_PASSWORD)) return next();
+  return res.status(401).json({ success: false, error: 'Yetkisiz. Uygulama parolası gerekli.', authRequired: true });
+});
+
+app.get('/api/auth/status', (_req, res) => {
+  res.json({ success: true, protected: !!APP_PASSWORD });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  if (!APP_PASSWORD) return res.json({ success: true, protected: false });
+  const ok = timingSafeEqual(req.body?.password || '', APP_PASSWORD);
+  if (!ok) return res.status(401).json({ success: false, error: 'Parola hatalı.' });
+  return res.json({ success: true, protected: true });
+});
+
 // ─── Genel adres ────────────────────────────────────────────────────────────
 // Instagram ve Facebook medyayı bizden İNDİRİR; bayt göndermeye izin vermezler.
 // Bu yüzden medyayı kısa süreliğine kendi sunucumuzdan yayınlamamız gerekiyor
@@ -190,20 +238,72 @@ app.get('/api/config', async (_req, res) => {
 //  yüzden başka bir tarayıcıdan ya da başka bir cihazdan girince liste boş
 //  görünüyordu. Artık tek doğru kaynak sunucu.
 // ═══════════════════════════════════════════════════════════════════════════
+// Giriş bilgileri (X çerezleri, Telegram oturum dizeleri) tarayıcıya geri
+// gönderilmez. Arayüzün bunlara ihtiyacı yok; gönderim sırasında sunucu
+// kimliği hesap kimliğinden kendisi çözüyor.
+function redactAccount(acc) {
+  const c = acc.credentials || {};
+  return {
+    ...acc,
+    credentials: {
+      // Kural motorunun ve arayüzün ihtiyaç duyduğu tek alan bu.
+      accountId: c.accountId,
+      username: c.username,
+      hasCookies: Array.isArray(c.cookies) && c.cookies.length > 0,
+      hasApiKeys: !!(c.consumerKey && c.consumerSecret),
+      hasSession: !!c.sessionString,
+    },
+  };
+}
+
+// Kurallar da hedeflerinin içinde giriş bilgisi taşıyabiliyor (eski biçim).
+function redactRule(rule) {
+  const scrub = (t) => {
+    if (!t?.credentials) return t;
+    const { credentials, ...rest } = t;
+    return { ...rest, hasCredentials: true };
+  };
+  return {
+    ...rule,
+    targets: (rule.targets || []).map(scrub),
+    targetAccounts: (rule.targetAccounts || []).map(scrub),
+  };
+}
+
 app.get('/api/accounts', (_req, res) => {
-  res.json({ success: true, accounts: [...accountsStore.values()] });
+  res.json({ success: true, accounts: [...accountsStore.values()].map(redactAccount) });
 });
 
 // Tek hesap ekle/güncelle. Aynı kimlik varsa üzerine yazar; farklıysa YENİ
 // hesap olarak eklenir, böylece birden fazla Telegram/X hesabı bağlanabilir.
+const ACCOUNT_FIELDS = ['id', 'platform', 'name', 'username', 'status', 'avatarColor'];
+const CREDENTIAL_FIELDS = ['accountId', 'username', 'sessionString', 'userId', 'cookies',
+  'consumerKey', 'consumerSecret', 'accessToken', 'accessTokenSecret'];
+
+// Yalnızca tanıdığımız alanları alıyoruz: istemcinin kayda keyfi alan
+// yazmasına gerek yok ve __proto__ gibi anahtarlar hiç girmesin.
+function sanitizeAccount(input, existing) {
+  const out = {};
+  for (const f of ACCOUNT_FIELDS) if (input[f] !== undefined) out[f] = input[f];
+
+  const inCred = input.credentials || {};
+  const cred = { ...(existing?.credentials || {}) };
+  for (const f of CREDENTIAL_FIELDS) if (inCred[f] !== undefined) cred[f] = inCred[f];
+  out.credentials = cred;
+  return { ...existing, ...out };
+}
+
 app.post('/api/accounts', (req, res) => {
   const acc = req.body || {};
   if (!acc.id || !acc.platform) {
     return res.status(400).json({ success: false, error: 'id ve platform zorunlu.' });
   }
-  accountsStore.set(acc.id, { ...accountsStore.get(acc.id), ...acc });
+  if (acc.id === '__proto__' || acc.id === 'constructor' || acc.id === 'prototype') {
+    return res.status(400).json({ success: false, error: 'Geçersiz hesap kimliği.' });
+  }
+  accountsStore.set(acc.id, sanitizeAccount(acc, accountsStore.get(acc.id)));
   saveState();
-  return res.json({ success: true, accounts: [...accountsStore.values()] });
+  return res.json({ success: true, accounts: [...accountsStore.values()].map(redactAccount) });
 });
 
 app.delete('/api/accounts/:id', (req, res) => {
@@ -220,7 +320,7 @@ app.delete('/api/accounts/:id', (req, res) => {
     tgActiveSessions.delete(tgId);
   }
   saveState();
-  return res.json({ success: true, accounts: [...accountsStore.values()] });
+  return res.json({ success: true, accounts: [...accountsStore.values()].map(redactAccount) });
 });
 
 // Tarayıcıda kalmış eski kayıtları bir kereye mahsus sunucuya taşır.
@@ -234,7 +334,7 @@ app.post('/api/accounts/import', (req, res) => {
     added++;
   }
   if (added) saveState();
-  return res.json({ success: true, added, accounts: [...accountsStore.values()] });
+  return res.json({ success: true, added, accounts: [...accountsStore.values()].map(redactAccount) });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1383,7 +1483,7 @@ app.post('/api/twitter/send', async (req, res) => {
 //  SYNC RULES & TEST PIPELINE
 // ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/sync/rules', (_req, res) => {
-  res.json({ success: true, rules: [...syncRulesStore.values()] });
+  res.json({ success: true, rules: [...syncRulesStore.values()].map(redactRule) });
 });
 
 app.post('/api/sync/rules', (req, res) => {
@@ -1886,7 +1986,12 @@ async function deliverToTarget(target, post, rule) {
   try {
     switch (target.platform) {
       case 'twitter': {
-        const c = target.credentials || {};
+        // Giriş bilgisi artık tarayıcıya gönderilmediği için kuralda da
+        // olmayabilir; hesap kimliğinden sunucudaki kaydı çözüyoruz.
+        const c = target.credentials
+          || accountsStore.get(target.accountId)?.credentials
+          || [...accountsStore.values()].find(a => a.platform === 'twitter' && a.name === target.name)?.credentials
+          || {};
         if (Array.isArray(c.cookies) && c.cookies.length > 0) {
           const r = await postTweetViaCookies(c.cookies, post.text, post.media, opts.replyMode || rule.replyMode);
           return { success: r.success, error: r.error };
@@ -2257,6 +2362,11 @@ for (const a of saved.accounts || []) {
 
 app.listen(PORT, () => {
   console.log(`🚀 Telegram-Twitter AutoSync server running on port ${PORT}`);
+  if (!APP_PASSWORD) {
+    console.warn('⚠️  APP_PASSWORD tanımlı değil: yönetim uçları korumasız. Bu sunucu X çerezlerini');
+    console.warn('⚠️  ve Telegram oturumlarını tutuyor; adresi bilen herkes hesapları yönetebilir.');
+    console.warn('⚠️  Render → Environment → APP_PASSWORD ekleyerek kapatabilirsin.');
+  }
   // Auto-start listeners after 3s
   setTimeout(() => {
     for (const id of tgActiveSessions.keys()) {

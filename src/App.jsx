@@ -5,12 +5,69 @@ import AccountManager from './components/AccountManager';
 import SyncRules from './components/SyncRules';
 import ActivityLogs from './components/ActivityLogs';
 
-import { 
-  INITIAL_ACCOUNTS, 
-  INITIAL_SYNC_RULES, 
+import {
+  INITIAL_ACCOUNTS,
+  INITIAL_SYNC_RULES,
   getStoredData,
   saveStoredData
 } from './data/mockData';
+import { installFetchInterceptor, setUnauthorizedHandler, setPassword } from './api';
+
+installFetchInterceptor();
+
+function LoginGate({ onSuccess }) {
+  const [pw, setPw] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!pw.trim() || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      // Parolayı önce kaydediyoruz ki araya giren katman başlığa ekleyebilsin.
+      setPassword(pw);
+      const r = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw }),
+      }).then(x => x.json());
+      if (!r.success) throw new Error(r.error || 'Parola hatalı.');
+      onSuccess();
+    } catch (e) {
+      setError(e.message);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+      <div className="w-full max-w-sm bg-slate-900 border border-slate-700 rounded-2xl p-6 space-y-4 shadow-2xl">
+        <div className="text-center space-y-1">
+          <div className="text-4xl">🔐</div>
+          <h1 className="text-lg font-bold text-white">OmniSync</h1>
+          <p className="text-xs text-slate-400">Devam etmek için uygulama parolanı gir.</p>
+        </div>
+        <input
+          type="password"
+          autoFocus
+          value={pw}
+          onChange={e => setPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+          placeholder="••••••••"
+          className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:border-sky-500 outline-none"
+        />
+        {error && (
+          <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-500/30 text-xs text-rose-300">{error}</div>
+        )}
+        <button onClick={submit} disabled={busy || !pw.trim()}
+          className="w-full py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-bold text-xs">
+          {busy ? 'Kontrol ediliyor...' : 'Giriş Yap'}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('accounts');
@@ -21,13 +78,26 @@ export default function App() {
   const [accounts, setAccounts] = useState(INITIAL_ACCOUNTS);
   const [rules, setRules]       = useState(INITIAL_SYNC_RULES);
   const [loaded, setLoaded]     = useState(false);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [unprotected, setUnprotected] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
 
   // Toast notification state
   const [toast, setToast] = useState({ visible: false, message: '', type: 'info' });
 
+  useEffect(() => { setUnauthorizedHandler(() => setNeedsLogin(true)); }, []);
+
   useEffect(() => {
     (async () => {
       try {
+        // Sunucu korumalıysa ve elimizde geçerli parola yoksa önce giriş iste.
+        const auth = await fetch('/api/auth/status').then(r => r.json()).catch(() => ({}));
+        setUnprotected(auth.protected === false);
+        if (auth.protected) {
+          const probe = await fetch('/api/accounts');
+          if (probe.status === 401) { setNeedsLogin(true); setLoaded(true); return; }
+        }
+
         // Tarayıcıda kalmış eski hesaplar varsa önce sunucuya taşı.
         const legacy = getStoredData('accounts', []);
         if (Array.isArray(legacy) && legacy.length) {
@@ -61,7 +131,7 @@ export default function App() {
         setLoaded(true);
       }
     })();
-  }, []);
+  }, [reloadKey]);
 
   // Kurallar sunucuya SyncRules içinden zaten yazılıyor; burada yalnızca
   // yerel bir yedek tutuyoruz ki çevrimdışıyken de bir şey görünsün.
@@ -100,9 +170,23 @@ export default function App() {
     }, 3500);
   };
 
+  if (needsLogin) {
+    return <LoginGate onSuccess={() => { setNeedsLogin(false); setReloadKey(k => k + 1); }} />;
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100 font-sans antialiased">
-      
+
+      {/* Sunucu korumasızsa bunu görmezden gelinemeyecek şekilde söyle:
+          burada canlı X çerezleri ve Telegram oturumları duruyor. */}
+      {unprotected && (
+        <div className="bg-amber-950/80 border-b border-amber-500/40 px-4 py-2 text-[11px] text-amber-200 text-center">
+          ⚠️ Bu uygulama parolasız açık. Adresi bilen herkes bağlı hesaplarını yönetebilir ve
+          onlar adına paylaşım yapabilir. Render → Environment → <code className="font-mono">APP_PASSWORD</code> ekleyip
+          servisi yeniden dağıt.
+        </div>
+      )}
+
       {/* Toast Popup Notification */}
       {toast.visible && (
         <div className={`
