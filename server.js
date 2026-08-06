@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
 import fs from 'fs';
+import { createStore } from './storage.js';
 import {
   PLATFORMS, postToTelegram, parseTelegramTarget, downloadMedia,
   fetchTwitterTimeline, twitterItemToPost, parseTwitterHandle,
@@ -40,6 +41,12 @@ app.use(express.json({ limit: '10mb' }));
 // ═══════════════════════════════════════════════════════════════════════════
 const APP_PASSWORD = process.env.APP_PASSWORD || '';
 
+// Ortam değişkeni yoksa kalıcı depoda saklanan otomatik parolayı kullanıyoruz,
+// böylece uygulama hiçbir koşulda korumasız kalmıyor.
+function activePassword() {
+  return APP_PASSWORD || appSettings.appPassword || '';
+}
+
 // Meta bu adrese tarayıcı yönlendirmesiyle gelir, başlık gönderemez; state
 // parametresiyle korunuyor. Sağlık ucu ve giriş ucu da açık olmalı.
 // Dikkat: app.use('/api', ...) içinde req.path mount noktasına GÖRELİdir,
@@ -58,23 +65,40 @@ function timingSafeEqual(a, b) {
 }
 
 app.use('/api', (req, res, next) => {
-  if (!APP_PASSWORD) return next();
+  const pw = activePassword();
+  if (!pw) return next();
   if (OPEN_PATHS.some(re => re.test(req.path))) return next();
 
   const supplied = req.get('x-app-password') || '';
-  if (supplied && timingSafeEqual(supplied, APP_PASSWORD)) return next();
+  if (supplied && timingSafeEqual(supplied, pw)) return next();
   return res.status(401).json({ success: false, error: 'Yetkisiz. Uygulama parolası gerekli.', authRequired: true });
 });
 
 app.get('/api/auth/status', (_req, res) => {
-  res.json({ success: true, protected: !!APP_PASSWORD });
+  res.json({ success: true, protected: !!activePassword(), fromEnv: !!APP_PASSWORD });
 });
 
 app.post('/api/auth/login', (req, res) => {
-  if (!APP_PASSWORD) return res.json({ success: true, protected: false });
-  const ok = timingSafeEqual(req.body?.password || '', APP_PASSWORD);
+  const pw = activePassword();
+  if (!pw) return res.json({ success: true, protected: false });
+  const ok = timingSafeEqual(req.body?.password || '', pw);
   if (!ok) return res.status(401).json({ success: false, error: 'Parola hatalı.' });
   return res.json({ success: true, protected: true });
+});
+
+// Parolayı arayüzden değiştirebilmek için (ortam değişkeni varsa o kazanır).
+app.post('/api/auth/change-password', (req, res) => {
+  if (APP_PASSWORD) {
+    return res.status(400).json({
+      success: false,
+      error: 'Parola Render ortam değişkeninden geliyor; değiştirmek için APP_PASSWORD değerini güncelle.',
+    });
+  }
+  const next = String(req.body?.password || '');
+  if (next.length < 8) return res.status(400).json({ success: false, error: 'Parola en az 8 karakter olmalı.' });
+  appSettings.appPassword = next;
+  saveState();
+  return res.json({ success: true });
 });
 
 // ─── Genel adres ────────────────────────────────────────────────────────────
@@ -98,43 +122,80 @@ const recentlySynced   = new Set(); // messageId -> to prevent duplicate tweets
 const syncLog          = [];        // audit trail for auto-sync activity
 
 // ─── Disk persistence ────────────────────────────────────────────────────────
-const DATA_DIR   = process.env.DATA_DIR || path.join(__dirname, 'data');
-const STATE_FILE = path.join(DATA_DIR, 'state.json');
+// Render'da kalıcı disk /var/data'ya bağlanıyor (render.yaml). Değişken
+// tanımlıysa o kazanır; hiçbiri yoksa yerel geliştirme klasörü kullanılır.
+const DATA_DIR = process.env.DATA_DIR
+  || (process.env.RENDER ? '/var/data' : path.join(__dirname, 'data'));
 
-function saveState() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-    const sessions = [...tgActiveSessions.values()].map(s => ({
+// Ayarlar da kalıcı depoda yaşıyor; böylece Meta anahtarlarını arayüzden
+// girmek yeterli oluyor, Render ortam değişkenlerini elle düzenlemek gerekmiyor.
+let appSettings = {};
+
+// Depolama katmanı açılışta seçiliyor (Postgres varsa o, yoksa disk).
+let store = null;
+let storeInfo = { kind: 'none', durable: false, detail: 'Depolama henüz hazır değil.' };
+
+// Yazma isteklerini biriktiriyoruz: art arda gelen değişikliklerde her seferinde
+// veritabanına gitmek yerine kısa bir gecikmeyle tek yazma yapıyoruz.
+let saveTimer = null;
+let savePending = false;
+
+function collectState() {
+  return {
+    sessions: [...tgActiveSessions.values()].map(s => ({
       accountId: s.accountId,
       accountName: s.accountName,
       sessionString: s.sessionString,
       apiId: s.apiId,
       apiHash: s.apiHash,
-    }));
-    const rules = [...syncRulesStore.values()];
+    })),
+    rules: [...syncRulesStore.values()],
     // İmleçler olmadan yeniden başlatma sonrası kaynaklar "ilk tur" sayılır ve
     // son gönderiler tekrar paylaşılırdı.
-    const cursors = Object.fromEntries(sourceCursors);
-    const meta = [...metaAccounts.values()];
-    const accounts = [...accountsStore.values()];
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules, cursors, meta, accounts }, null, 2), { mode: 0o600 });
+    cursors: Object.fromEntries(sourceCursors),
+    meta: [...metaAccounts.values()],
+    accounts: [...accountsStore.values()],
+    settings: appSettings,
+    savedAt: new Date().toISOString(),
+  };
+}
+
+async function flushState() {
+  savePending = false;
+  if (!store) return;
+  try {
+    await store.save(collectState());
   } catch (e) {
-    console.error('[Persist] Failed to save state:', e.message);
+    console.error('[Depolama] Kaydedilemedi:', e.message);
   }
 }
 
-function loadState() {
+// Çağıranlar bunu sık çağırıyor; gerçek yazmayı kısa süre geciktirip
+// birleştiriyoruz ama en fazla 2 saniye içinde diske/veritabanına iniyor.
+function saveState() {
+  savePending = true;
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    if (savePending) flushState();
+  }, 2000);
+}
+
+const EMPTY_STATE = { sessions: [], rules: [], cursors: {}, meta: [], accounts: [], settings: {} };
+
+async function loadState() {
+  if (!store) return { ...EMPTY_STATE };
   try {
-    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [], cursors: {}, meta: [], accounts: [] };
-    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const parsed = await store.load();
+    if (!parsed) return { ...EMPTY_STATE };
     return {
       sessions: parsed.sessions || [], rules: parsed.rules || [],
       cursors: parsed.cursors || {}, meta: parsed.meta || [],
-      accounts: parsed.accounts || [],
+      accounts: parsed.accounts || [], settings: parsed.settings || {},
     };
   } catch (e) {
-    console.error('[Persist] Failed to load state:', e.message);
-    return { sessions: [], rules: [], cursors: {}, meta: [], accounts: [] };
+    console.error('[Depolama] Yüklenemedi:', e.message);
+    return { ...EMPTY_STATE };
   }
 }
 
@@ -229,6 +290,76 @@ app.get('/api/config', async (_req, res) => {
   }
 
   res.json({ telegramReady, autoTwitterAccount });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DEPOLAMA DURUMU & YEDEKLER
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/storage/status', async (_req, res) => {
+  let backupCount = 0;
+  try { backupCount = (await store?.backups() || []).length; } catch { /* önemsiz */ }
+  res.json({
+    success: true,
+    ...storeInfo,
+    accounts: accountsStore.size,
+    rules: syncRulesStore.size,
+    telegramSessions: tgActiveSessions.size,
+    metaAccounts: metaAccounts.size,
+    backupCount,
+  });
+});
+
+app.get('/api/storage/backups', async (_req, res) => {
+  try {
+    return res.json({ success: true, backups: await store.backups() });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/api/storage/restore', async (req, res) => {
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ success: false, error: 'Yedek kimliği gerekli.' });
+  try {
+    const restored = await store.restore(id);
+    // Geri yükledikten sonra bellekteki durumu da tazeliyoruz, yoksa bir
+    // sonraki kayıt eski hâli tekrar yazardı.
+    accountsStore.clear();
+    for (const a of restored.accounts || []) accountsStore.set(a.id, a);
+    syncRulesStore.clear();
+    for (const r of restored.rules || []) syncRulesStore.set(r.id, r);
+    metaAccounts.clear();
+    for (const a of restored.meta || []) metaAccounts.set(a.id, a);
+    return res.json({ success: true, accounts: accountsStore.size, rules: syncRulesStore.size });
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Elle yedek indirme: kullanıcı kendi kopyasını saklayabilsin.
+app.get('/api/storage/export', (_req, res) => {
+  res.set('Content-Disposition', `attachment; filename="omnisync-yedek-${Date.now()}.json"`);
+  res.set('Content-Type', 'application/json');
+  res.send(JSON.stringify(collectState(), null, 2));
+});
+
+app.post('/api/storage/import', async (req, res) => {
+  const incoming = req.body?.state;
+  if (!incoming || typeof incoming !== 'object') {
+    return res.status(400).json({ success: false, error: 'Geçerli bir yedek dosyası gerekli.' });
+  }
+  try {
+    for (const a of incoming.accounts || []) accountsStore.set(a.id, a);
+    for (const r of incoming.rules || []) syncRulesStore.set(r.id, r);
+    for (const a of incoming.meta || []) metaAccounts.set(a.id, a);
+    for (const s of incoming.sessions || []) {
+      if (!tgActiveSessions.has(s.accountId)) tgActiveSessions.set(s.accountId, { ...s, client: null });
+    }
+    await flushState();
+    return res.json({ success: true, accounts: accountsStore.size, rules: syncRulesStore.size });
+  } catch (e) {
+    return res.status(400).json({ success: false, error: e.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -655,9 +786,22 @@ app.post('/api/telegram/session/start-listener', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 //  META (Instagram & Facebook) ─ OAuth ve hesap yönetimi
 // ═══════════════════════════════════════════════════════════════════════════
-const META_APP_ID     = process.env.META_APP_ID     || '';
-const META_APP_SECRET = process.env.META_APP_SECRET || '';
+// Anahtarlar ortam değişkeninden ya da arayüzden girilebiliyor. Arayüzden
+// girmek Render'da elle değişken düzenleme zorunluluğunu kaldırıyor.
+const metaAppId     = () => process.env.META_APP_ID     || appSettings.metaAppId     || '';
+const metaAppSecret = () => process.env.META_APP_SECRET || appSettings.metaAppSecret || '';
 const oauthStates = new Map(); // state -> { platform, createdAt }
+
+app.post('/api/meta/settings', (req, res) => {
+  const { appId, appSecret } = req.body || {};
+  if (!appId?.trim() || !appSecret?.trim()) {
+    return res.status(400).json({ success: false, error: 'Uygulama kimliği ve gizli anahtarı gerekli.' });
+  }
+  appSettings.metaAppId = appId.trim();
+  appSettings.metaAppSecret = appSecret.trim();
+  saveState();
+  return res.json({ success: true });
+});
 
 function metaRedirectUri(platform) {
   return `${PUBLIC_BASE_URL}/api/${platform}/callback`;
@@ -665,7 +809,7 @@ function metaRedirectUri(platform) {
 
 function metaConfigError() {
   if (!PUBLIC_BASE_URL) return 'PUBLIC_URL ayarlı değil. Render ortam değişkenlerine uygulamanın genel adresini ekle.';
-  if (!META_APP_ID || !META_APP_SECRET) return 'META_APP_ID ve META_APP_SECRET ayarlı değil. Meta geliştirici uygulamanı oluşturup bu değerleri Render ortam değişkenlerine ekle.';
+  if (!metaAppId() || !metaAppSecret()) return 'Meta uygulama anahtarları girilmemiş. Bağlantılar sekmesindeki kurulum penceresinden ekleyebilirsin.';
   return null;
 }
 
@@ -706,7 +850,7 @@ app.get('/api/:platform(instagram|facebook)/auth-url', (req, res) => {
 
   const platform = req.params.platform;
   const state = newOAuthState(platform);
-  const args = { appId: META_APP_ID, redirectUri: metaRedirectUri(platform), state };
+  const args = { appId: metaAppId(), redirectUri: metaRedirectUri(platform), state };
   const url = platform === 'instagram' ? instagramAuthUrl(args) : facebookAuthUrl(args);
   return res.json({ success: true, url });
 });
@@ -742,7 +886,7 @@ app.get('/api/:platform(instagram|facebook)/callback', async (req, res) => {
 
   try {
     const args = {
-      appId: META_APP_ID, appSecret: META_APP_SECRET,
+      appId: metaAppId(), appSecret: metaAppSecret(),
       redirectUri: metaRedirectUri(platform), code: String(code),
     };
 
@@ -2343,7 +2487,12 @@ app.get('*', (_req, res) => {
 });
 
 // Restore saved sessions and listener loops on server boot
-const saved = loadState();
+// Depolama hazır olmadan istek almaya başlarsak boş durumla çalışıp üstüne
+// yazma riski var; bu yüzden önce yükleyip sonra dinlemeye başlıyoruz.
+store = await createStore({ databaseUrl: process.env.DATABASE_URL, dataDir: DATA_DIR });
+storeInfo = store.describe();
+
+const saved = await loadState();
 for (const s of saved.sessions) {
   tgActiveSessions.set(s.accountId, { ...s, client: null });
 }
@@ -2359,14 +2508,39 @@ for (const a of saved.meta || []) {
 for (const a of saved.accounts || []) {
   accountsStore.set(a.id, a);
 }
+appSettings = saved.settings || {};
+
+console.log(`[Depolama] ${storeInfo.detail}`);
+console.log(`[Depolama] ${accountsStore.size} hesap, ${syncRulesStore.size} kural yüklendi.`);
+
+// Parola: ortam değişkeni varsa o kullanılır. Yoksa bir kez üretip kalıcı
+// depoya yazıyoruz — böylece uygulama hiçbir zaman parolasız açık kalmıyor
+// ve her yeniden başlatmada parola değişmiyor.
+if (!APP_PASSWORD) {
+  if (!appSettings.appPassword) {
+    appSettings.appPassword = crypto.randomBytes(9).toString('base64url');
+    saveState();
+    console.warn('════════════════════════════════════════════════════════════');
+    console.warn('  APP_PASSWORD tanımlı değildi, otomatik bir parola üretildi:');
+    console.warn(`      ${appSettings.appPassword}`);
+    console.warn('  Bu parola kalıcı depoda saklanıyor ve değişmeyecek.');
+    console.warn('════════════════════════════════════════════════════════════');
+  } else {
+    console.log('[Güvenlik] Kayıtlı uygulama parolası kullanılıyor.');
+  }
+}
+
+// Kapanırken bekleyen yazmayı kaybetmeyelim.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => {
+    console.log(`[Sunucu] ${sig} alındı, durum kaydediliyor...`);
+    await flushState();
+    process.exit(0);
+  });
+}
 
 app.listen(PORT, () => {
   console.log(`🚀 Telegram-Twitter AutoSync server running on port ${PORT}`);
-  if (!APP_PASSWORD) {
-    console.warn('⚠️  APP_PASSWORD tanımlı değil: yönetim uçları korumasız. Bu sunucu X çerezlerini');
-    console.warn('⚠️  ve Telegram oturumlarını tutuyor; adresi bilen herkes hesapları yönetebilir.');
-    console.warn('⚠️  Render → Environment → APP_PASSWORD ekleyerek kapatabilirsin.');
-  }
   // Auto-start listeners after 3s
   setTimeout(() => {
     for (const id of tgActiveSessions.keys()) {

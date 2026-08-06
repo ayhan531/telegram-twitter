@@ -1,14 +1,40 @@
 # Render Blueprint deployment definition
+#
+# ÖNEMLİ: Render'ın normal dosya sistemi GEÇİCİdir — her deploy'da sıfırlanır.
+# Bağlı hesapların güncelleme sonrası kaybolmaması için iki katman var:
+#   1. Postgres (asıl depo)   — deploy'dan ve yeniden başlatmadan etkilenmez
+#   2. Kalıcı disk (/var/data) — veritabanına ulaşılamazsa yedek yol
+databases:
+  - name: omni-social-db
+    databaseName: omnisync
+    plan: free
+    region: frankfurt
+
 services:
   - type: web
     name: omni-social-sync
     env: node
     region: frankfurt
-    plan: free
+    plan: starter
     buildCommand: npm install && npm run build
     startCommand: npm start
+    disk:
+      name: omni-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 3000
+      - key: DATA_DIR
+        value: /var/data
+      # Bağlantı dizesini Render otomatik dolduruyor.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: omni-social-db
+          property: connectionString
+      # Giriş parolası. Panelden değer gir; boş bırakılırsa uygulama ilk
+      # açılışta kendi parolasını üretir ve kalıcı olarak saklar.
+      - key: APP_PASSWORD
+        sync: false

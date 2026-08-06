@@ -111,11 +111,41 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
 
   // ── Meta (Instagram / Facebook) State ──
   const [metaStatus, setMetaStatus] = useState({ configured: false, accounts: [] });
+  const [metaAppIdInput, setMetaAppIdInput] = useState('');
+  const [metaSecretInput, setMetaSecretInput] = useState('');
+  const [savingMeta, setSavingMeta] = useState(false);
+
+  // ── Depolama durumu ──
+  const [storage, setStorage] = useState(null);
 
   const loadMetaStatus = () =>
     fetch('/api/meta/status').then(r => r.json()).then(setMetaStatus).catch(() => {});
 
-  useEffect(() => { loadMetaStatus(); }, []);
+  const loadStorage = () =>
+    fetch('/api/storage/status').then(r => r.json()).then(setStorage).catch(() => {});
+
+  useEffect(() => { loadMetaStatus(); loadStorage(); }, []);
+
+  const saveMetaKeys = async () => {
+    if (!metaAppIdInput.trim() || !metaSecretInput.trim()) {
+      return onShowToast('Uygulama kimliği ve gizli anahtar gerekli.', 'error');
+    }
+    setSavingMeta(true);
+    try {
+      const r = await fetch('/api/meta/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appId: metaAppIdInput, appSecret: metaSecretInput }),
+      }).then(x => x.json());
+      if (!r.success) throw new Error(r.error);
+      setMetaSecretInput('');
+      await loadMetaStatus();
+      onShowToast('Meta anahtarları kaydedildi. Artık bağlanabilirsin.', 'success');
+    } catch (e) {
+      onShowToast(e.message, 'error');
+    }
+    setSavingMeta(false);
+  };
 
   // OAuth ayrı pencerede yürüyor; kapandığında listeyi tazeliyoruz.
   const connectMeta = async (platform) => {
@@ -422,6 +452,35 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
         </div>
       </div>
 
+      {/* Depolama durumu — hesapların nerede saklandığı ve kalıcı olup olmadığı */}
+      {storage && (
+        <div className={`p-4 rounded-2xl border text-xs flex items-start gap-3 ${
+          storage.durable
+            ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-200'
+            : 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+        }`}>
+          <span className="text-lg leading-none">{storage.durable ? '🗄️' : '⚠️'}</span>
+          <div className="flex-1 min-w-0">
+            <p className="font-bold">
+              {storage.durable ? 'Veriler kalıcı olarak saklanıyor' : 'DİKKAT: Veriler kalıcı DEĞİL'}
+            </p>
+            <p className="opacity-90 mt-0.5">{storage.detail}</p>
+            <p className="opacity-75 mt-1">
+              {storage.accounts} hesap · {storage.rules} kural · {storage.backupCount} yedek
+            </p>
+            {!storage.durable && (
+              <p className="mt-1 font-semibold">
+                Render → New → Postgres oluştur ve bu servise bağla. Güncelleme attığında hesapların silinmez.
+              </p>
+            )}
+          </div>
+          <a href="/api/storage/export"
+            className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 font-bold">
+            ⬇ Yedek indir
+          </a>
+        </div>
+      )}
+
       {/* Main Connection Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 
@@ -586,10 +645,10 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
                  'developers.facebook.com/apps → "Uygulama oluştur". Facebook Sayfası da bağlayacaksan ürün olarak "Facebook Login", Instagram için "Instagram" ürününü ekle.'],
                 ['Yönlendirme adreslerini ekle',
                  'Uygulama ayarlarında geçerli OAuth yönlendirme adresi olarak aşağıdaki iki adresi ekle. Birebir aynı olmalı.'],
-                ['Kimlik bilgilerini Render\'a gir',
-                 'Render → servisin → Environment sekmesi. META_APP_ID ve META_APP_SECRET değişkenlerini uygulamanın kimlik bilgileriyle ekle. PUBLIC_URL zaten Render tarafından ayarlanıyor; ayarlı değilse uygulamanın adresini ekle.'],
+                ['Anahtarları aşağıya yapıştır',
+                 'Meta uygulamanın "Uygulama kimliği" ve "Uygulama gizli anahtarı" değerlerini aşağıdaki forma gir. Render ayarlarına dokunman gerekmiyor; anahtarlar veritabanına kaydediliyor.'],
                 ['Bağlan',
-                 'Render yeniden dağıttıktan sonra bu sayfaya dön ve "Instagram Bağla" / "Facebook Bağla" düğmesine bas.'],
+                 'Kaydettikten sonra "Instagram Bağla" / "Facebook Bağla" düğmesine bas. Hepsi bu.'],
               ].map(([head, body], i) => (
                 <li key={i} className="flex gap-3">
                   <span className="shrink-0 w-6 h-6 rounded-full bg-indigo-600 text-white font-bold flex items-center justify-center text-[11px]">{i + 1}</span>
@@ -613,6 +672,24 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
                   PUBLIC_URL ayarlı değil, adresleri gösteremiyorum. Render ortam değişkenlerine
                   uygulamanın genel adresini ekle (örn. https://uygulamam.onrender.com).
                 </p>
+              )}
+            </div>
+
+            {/* Anahtar formu: Render ortam değişkenlerini elle düzenlemeye gerek yok */}
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-700 space-y-2">
+              <p className="text-[11px] font-bold text-slate-300">Meta uygulama anahtarların</p>
+              <input type="text" value={metaAppIdInput} onChange={e => setMetaAppIdInput(e.target.value)}
+                placeholder="Uygulama kimliği (App ID)"
+                className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-white text-xs font-mono" />
+              <input type="password" value={metaSecretInput} onChange={e => setMetaSecretInput(e.target.value)}
+                placeholder="Uygulama gizli anahtarı (App Secret)"
+                className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-white text-xs font-mono" />
+              <button onClick={saveMetaKeys} disabled={savingMeta}
+                className="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs">
+                {savingMeta ? 'Kaydediliyor...' : 'Anahtarları Kaydet'}
+              </button>
+              {metaStatus.configured && (
+                <p className="text-[11px] text-emerald-400">✅ Anahtarlar kayıtlı, bağlanmaya hazır.</p>
               )}
             </div>
 
