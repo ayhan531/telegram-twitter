@@ -15,33 +15,83 @@ import {
 export default function App() {
   const [activeTab, setActiveTab] = useState('accounts');
 
-  // Persistent States
-  const [accounts, setAccounts] = useState(() => getStoredData('accounts', INITIAL_ACCOUNTS));
-  const [rules, setRules]       = useState(() => getStoredData('rules', INITIAL_SYNC_RULES));
+  // Hesaplar ve kurallar sunucuda yaşıyor: hangi tarayıcıdan, hangi cihazdan
+  // ya da hangi Google hesabından girersen gir aynı listeyi görürsün.
+  // localStorage yalnızca eski kayıtları bir kez taşımak için okunuyor.
+  const [accounts, setAccounts] = useState(INITIAL_ACCOUNTS);
+  const [rules, setRules]       = useState(INITIAL_SYNC_RULES);
+  const [loaded, setLoaded]     = useState(false);
 
   // Toast notification state
   const [toast, setToast] = useState({ visible: false, message: '', type: 'info' });
 
-  // Sync to local storage
-  useEffect(() => { saveStoredData('accounts', accounts); }, [accounts]);
-  useEffect(() => { saveStoredData('rules', rules); }, [rules]);
-
-  // Auto-load Twitter account if Environment Variables exist on server
   useEffect(() => {
-    fetch('/api/config')
-      .then(r => r.json())
-      .then(d => {
-        if (d.autoTwitterAccount) {
-          setAccounts(prev => {
-            if (prev.some(a => a.id === d.autoTwitterAccount.id || a.username === d.autoTwitterAccount.username)) {
-              return prev;
-            }
-            return [...prev, d.autoTwitterAccount];
-          });
+    (async () => {
+      try {
+        // Tarayıcıda kalmış eski hesaplar varsa önce sunucuya taşı.
+        const legacy = getStoredData('accounts', []);
+        if (Array.isArray(legacy) && legacy.length) {
+          const r = await fetch('/api/accounts/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accounts: legacy }),
+          }).then(x => x.json());
+          if (r.success) {
+            saveStoredData('accounts', []); // taşındı, bir daha gönderme
+            if (r.added) showToast(`${r.added} hesap sunucuya taşındı.`, 'success');
+          }
         }
-      })
-      .catch(() => {});
+
+        const [accRes, ruleRes, cfg] = await Promise.all([
+          fetch('/api/accounts').then(r => r.json()).catch(() => ({})),
+          fetch('/api/sync/rules').then(r => r.json()).catch(() => ({})),
+          fetch('/api/config').then(r => r.json()).catch(() => ({})),
+        ]);
+
+        let list = accRes.accounts || [];
+        // Ortam değişkeniyle tanımlı Twitter hesabı varsa listeye kat.
+        if (cfg.autoTwitterAccount && !list.some(a => a.username === cfg.autoTwitterAccount.username)) {
+          list = [...list, cfg.autoTwitterAccount];
+        }
+        setAccounts(list);
+        setRules(ruleRes.rules || []);
+      } catch (e) {
+        showToast('Sunucudan veriler yüklenemedi: ' + e.message, 'error');
+      } finally {
+        setLoaded(true);
+      }
+    })();
   }, []);
+
+  // Kurallar sunucuya SyncRules içinden zaten yazılıyor; burada yalnızca
+  // yerel bir yedek tutuyoruz ki çevrimdışıyken de bir şey görünsün.
+  useEffect(() => { if (loaded) saveStoredData('rules', rules); }, [rules, loaded]);
+
+  // Hesap ekleme/çıkarma sunucu üzerinden yürüyor; sunucunun döndürdüğü liste
+  // tek doğru kaynak olduğu için yereldeki durumu onunla değiştiriyoruz.
+  const upsertAccount = async (acc) => {
+    try {
+      const r = await fetch('/api/accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(acc),
+      }).then(x => x.json());
+      if (!r.success) throw new Error(r.error);
+      setAccounts(r.accounts);
+    } catch (e) {
+      showToast('Hesap kaydedilemedi: ' + e.message, 'error');
+    }
+  };
+
+  const removeAccountById = async (id) => {
+    try {
+      const r = await fetch(`/api/accounts/${id}`, { method: 'DELETE' }).then(x => x.json());
+      if (!r.success) throw new Error(r.error);
+      setAccounts(r.accounts);
+    } catch (e) {
+      showToast('Hesap kaldırılamadı: ' + e.message, 'error');
+    }
+  };
 
   const showToast = (message, type = 'info') => {
     setToast({ visible: true, message, type });
@@ -85,9 +135,10 @@ export default function App() {
         {/* Content Area */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 min-w-0 overflow-y-auto">
           {activeTab === 'accounts' && (
-            <AccountManager 
+            <AccountManager
               accounts={accounts}
-              setAccounts={setAccounts}
+              upsertAccount={upsertAccount}
+              removeAccountById={removeAccountById}
               onShowToast={showToast}
             />
           )}

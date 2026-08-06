@@ -75,7 +75,7 @@ function MetaCard({
   );
 }
 
-export default function AccountManager({ accounts, setAccounts, onShowToast }) {
+export default function AccountManager({ accounts, upsertAccount, removeAccountById, onShowToast }) {
   const [activeModal, setActiveModal] = useState(null); // 'telegram' | 'twitter' | null
   const [twTab, setTwTab] = useState('auto_login'); // 'auto_login' (Default & Easy) | 'auth_token' | 'api_keys'
 
@@ -174,7 +174,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
 
         const username = `@${data.user?.username || twUsername.replace(/^@/, '')}`;
         const newAccount = {
-          id: `acc-tw-${Date.now()}`,
+          id: `acc-tw-${username.replace(/^@/, "").toLowerCase()}`,
           platform: 'twitter',
           name: data.user?.name || username,
           username,
@@ -186,7 +186,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           },
         };
 
-        setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
+        await upsertAccount(newAccount);
         onShowToast(`Twitter hesabı (${username}) otomatik giriş ile bağlandı! 🎉`, 'success');
         setTimeout(() => setActiveModal(null), 1200);
 
@@ -220,7 +220,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
 
         const username = `@${data.user?.username || 'twitter'}`;
         const newAccount = {
-          id: `acc-tw-${Date.now()}`,
+          id: `acc-tw-${username.replace(/^@/, "").toLowerCase()}`,
           platform: 'twitter',
           name: data.user?.name || data.user?.username || 'Twitter Hesabı',
           username,
@@ -232,7 +232,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           },
         };
 
-        setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
+        await upsertAccount(newAccount);
         onShowToast(`Twitter hesabı (${username}) bağlandı! 🎉`, 'success');
         setTimeout(() => setActiveModal(null), 1200);
 
@@ -257,7 +257,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
 
         const username = `@${data.user?.username || 'twitter'}`;
         const newAccount = {
-          id: `acc-tw-${Date.now()}`,
+          id: `acc-tw-${username.replace(/^@/, "").toLowerCase()}`,
           platform: 'twitter',
           name: data.user?.name || data.user?.username || 'Twitter Hesabı',
           username,
@@ -271,7 +271,7 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
           },
         };
 
-        setAccounts(prev => [...prev.filter(a => a.username !== username), newAccount]);
+        await upsertAccount(newAccount);
         onShowToast(`Twitter hesabı (${username}) bağlandı!`, 'success');
         setTimeout(() => setActiveModal(null), 1200);
       }
@@ -362,7 +362,11 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
             },
           };
 
-          setAccounts(prev => [...prev.filter(a => a.platform !== 'telegram'), newAccount]);
+          // Eskiden burada platformdaki TÜM Telegram hesapları siliniyordu,
+          // bu yüzden ikinci hesabı bağlayınca birincisi kayboluyordu.
+          // Kimlik hesabın kendi kimliği olduğu için upsert doğru davranıyor:
+          // aynı hesap güncellenir, farklı hesap eklenir.
+          await upsertAccount(newAccount);
           onShowToast(`Telegram hesabı (${accountName}) bağlandı!`, 'success');
           setTimeout(() => setActiveModal(null), 1200);
         } else if (data.status === 'error') {
@@ -394,8 +398,8 @@ export default function AccountManager({ accounts, setAccounts, onShowToast }) {
     }
   };
 
-  const removeAccount = (id) => {
-    setAccounts(prev => prev.filter(a => a.id !== id));
+  const removeAccount = async (id) => {
+    await removeAccountById(id);
     onShowToast('Hesap kaldırıldı.', 'info');
   };
 

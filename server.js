@@ -42,6 +42,7 @@ const PUBLIC_BASE_URL = (
 // ─── In-memory stores ────────────────────────────────────────────────────────
 const tgQRSessions     = new Map();
 const metaAccounts     = new Map(); // accountId -> { platform, token, expiresAt, ... }
+const accountsStore    = new Map(); // accountId -> arayüzün gördüğü hesap kaydı
 const tempMedia        = new Map(); // token -> { buffer, mediaType, expiresAt }
 const tgActiveSessions = new Map(); // accountId -> { client, sessionString, accountName, apiId, apiHash }
 const syncRulesStore   = new Map(); // ruleId -> rule object
@@ -67,7 +68,8 @@ function saveState() {
     // son gönderiler tekrar paylaşılırdı.
     const cursors = Object.fromEntries(sourceCursors);
     const meta = [...metaAccounts.values()];
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules, cursors, meta }, null, 2), { mode: 0o600 });
+    const accounts = [...accountsStore.values()];
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ sessions, rules, cursors, meta, accounts }, null, 2), { mode: 0o600 });
   } catch (e) {
     console.error('[Persist] Failed to save state:', e.message);
   }
@@ -75,15 +77,16 @@ function saveState() {
 
 function loadState() {
   try {
-    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [], cursors: {}, meta: [] };
+    if (!fs.existsSync(STATE_FILE)) return { sessions: [], rules: [], cursors: {}, meta: [], accounts: [] };
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     return {
       sessions: parsed.sessions || [], rules: parsed.rules || [],
       cursors: parsed.cursors || {}, meta: parsed.meta || [],
+      accounts: parsed.accounts || [],
     };
   } catch (e) {
     console.error('[Persist] Failed to load state:', e.message);
-    return { sessions: [], rules: [], cursors: {}, meta: [] };
+    return { sessions: [], rules: [], cursors: {}, meta: [], accounts: [] };
   }
 }
 
@@ -178,6 +181,60 @@ app.get('/api/config', async (_req, res) => {
   }
 
   res.json({ telegramReady, autoTwitterAccount });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HESAP DEPOSU
+//
+//  Hesaplar eskiden yalnızca tarayıcının localStorage'ında tutuluyordu; bu
+//  yüzden başka bir tarayıcıdan ya da başka bir cihazdan girince liste boş
+//  görünüyordu. Artık tek doğru kaynak sunucu.
+// ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/accounts', (_req, res) => {
+  res.json({ success: true, accounts: [...accountsStore.values()] });
+});
+
+// Tek hesap ekle/güncelle. Aynı kimlik varsa üzerine yazar; farklıysa YENİ
+// hesap olarak eklenir, böylece birden fazla Telegram/X hesabı bağlanabilir.
+app.post('/api/accounts', (req, res) => {
+  const acc = req.body || {};
+  if (!acc.id || !acc.platform) {
+    return res.status(400).json({ success: false, error: 'id ve platform zorunlu.' });
+  }
+  accountsStore.set(acc.id, { ...accountsStore.get(acc.id), ...acc });
+  saveState();
+  return res.json({ success: true, accounts: [...accountsStore.values()] });
+});
+
+app.delete('/api/accounts/:id', (req, res) => {
+  const id = req.params.id;
+  const acc = accountsStore.get(id);
+  accountsStore.delete(id);
+
+  // Telegram hesabıysa dinleyicisini de kapat; yoksa kaldırılmış bir hesap
+  // arka planda mesaj dinlemeye devam ederdi.
+  const tgId = acc?.credentials?.accountId || id;
+  const sess = tgActiveSessions.get(tgId);
+  if (sess) {
+    sess.client?.disconnect().catch(() => {});
+    tgActiveSessions.delete(tgId);
+  }
+  saveState();
+  return res.json({ success: true, accounts: [...accountsStore.values()] });
+});
+
+// Tarayıcıda kalmış eski kayıtları bir kereye mahsus sunucuya taşır.
+app.post('/api/accounts/import', (req, res) => {
+  const incoming = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
+  let added = 0;
+  for (const acc of incoming) {
+    if (!acc?.id || !acc.platform) continue;
+    if (accountsStore.has(acc.id)) continue;
+    accountsStore.set(acc.id, acc);
+    added++;
+  }
+  if (added) saveState();
+  return res.json({ success: true, added, accounts: [...accountsStore.values()] });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2193,6 +2250,9 @@ for (const [ruleId, cursor] of Object.entries(saved.cursors || {})) {
 }
 for (const a of saved.meta || []) {
   metaAccounts.set(a.id, a);
+}
+for (const a of saved.accounts || []) {
+  accountsStore.set(a.id, a);
 }
 
 app.listen(PORT, () => {
