@@ -51,9 +51,12 @@ function activePassword() {
 // parametresiyle korunuyor. Sağlık ucu ve giriş ucu da açık olmalı.
 // Dikkat: app.use('/api', ...) içinde req.path mount noktasına GÖRELİdir,
 // yani '/api/health' burada '/health' olarak görünür.
+// Dikkat: burada geniş bir desen kullanmak (örn. /^\/auth\//) parola
+// değiştirme ucunu da açar ve korumanın tamamını geçersiz kılar. Yalnızca
+// giriş yapmadan erişilmesi ZORUNLU olan uçlar listelenir.
 const OPEN_PATHS = [
   /^\/health$/,
-  /^\/auth\//,
+  /^\/auth\/(status|login)$/,
   /^\/(instagram|facebook)\/callback$/,
 ];
 
@@ -87,6 +90,9 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // Parolayı arayüzden değiştirebilmek için (ortam değişkeni varsa o kazanır).
+// Bu uç kimlik doğrulamasının ARKASINDA: OPEN_PATHS'e girmiyor. Ek olarak
+// mevcut parolayı da doğruluyoruz, böylece açık kalmış bir oturumu ele
+// geçiren biri parolayı sessizce değiştirip kilidi devralamaz.
 app.post('/api/auth/change-password', (req, res) => {
   if (APP_PASSWORD) {
     return res.status(400).json({
@@ -94,6 +100,15 @@ app.post('/api/auth/change-password', (req, res) => {
       error: 'Parola Render ortam değişkeninden geliyor; değiştirmek için APP_PASSWORD değerini güncelle.',
     });
   }
+
+  const current = activePassword();
+  if (current) {
+    const supplied = req.body?.currentPassword || req.get('x-app-password') || '';
+    if (!supplied || !timingSafeEqual(supplied, current)) {
+      return res.status(401).json({ success: false, error: 'Mevcut parola doğrulanamadı.' });
+    }
+  }
+
   const next = String(req.body?.password || '');
   if (next.length < 8) return res.status(400).json({ success: false, error: 'Parola en az 8 karakter olmalı.' });
   appSettings.appPassword = next;
@@ -2518,7 +2533,8 @@ console.log(`[Depolama] ${accountsStore.size} hesap, ${syncRulesStore.size} kura
 // ve her yeniden başlatmada parola değişmiyor.
 if (!APP_PASSWORD) {
   if (!appSettings.appPassword) {
-    appSettings.appPassword = crypto.randomBytes(9).toString('base64url');
+    // 24 bayt ≈ 192 bit: kaba kuvvetle denenmesi mümkün değil.
+    appSettings.appPassword = crypto.randomBytes(24).toString('base64url');
     saveState();
     console.warn('════════════════════════════════════════════════════════════');
     console.warn('  APP_PASSWORD tanımlı değildi, otomatik bir parola üretildi:');
