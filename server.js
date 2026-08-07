@@ -1678,10 +1678,39 @@ app.get('/api/sync/rules', (_req, res) => {
   res.json({ success: true, rules: [...syncRulesStore.values()].map(redactRule) });
 });
 
+// Kurala giriş bilgisi YAZMIYORUZ. Tarayıcının gönderdiği kimlik nesnesi
+// sansürlü bir kopya olduğu için işe yaramaz; gerçeği zaten hesap deposunda
+// duruyor ve gönderim anında oradan çözülüyor. Böylece hem hata tekrarlamıyor
+// hem de kimlik tek yerde kalıyor.
+function stripRuleCredentials(rule) {
+  const clean = (t) => {
+    if (!t) return t;
+    const { credentials, hasCredentials, ...rest } = t;
+    return rest;
+  };
+  return {
+    ...rule,
+    targets: (rule.targets || []).map(clean),
+    targetAccounts: (rule.targetAccounts || []).map(clean),
+  };
+}
+
 app.post('/api/sync/rules', (req, res) => {
   const rule = req.body;
   if (!rule?.id) return res.status(400).json({ success: false, error: 'Kural ID eksik.' });
-  syncRulesStore.set(rule.id, { ...rule, enabled: rule.enabled !== false });
+
+  // Eski kurallarda gerçek çerezler saklı olabilir; üzerine yazarken onları
+  // kaybetmemek için mevcut kaydın kullanılabilir kimliklerini koruyoruz.
+  const existing = syncRulesStore.get(rule.id);
+  const cleaned = stripRuleCredentials(rule);
+  if (existing) {
+    for (const t of cleaned.targets) {
+      const prev = (existing.targets || []).find(p => p.platform === t.platform && p.accountId === t.accountId);
+      if (prev && isUsableTwitterCredential(prev.credentials)) t.credentials = prev.credentials;
+    }
+  }
+
+  syncRulesStore.set(rule.id, { ...cleaned, enabled: rule.enabled !== false });
   saveState();
   return res.json({ success: true });
 });
@@ -2167,6 +2196,33 @@ function ruleTargets(rule) {
   }));
 }
 
+// Bir kimlik nesnesinin GERÇEKTEN gönderim yapmaya yetip yetmediği.
+// Arayüze sansürlü bir kopya gönderiyoruz ({hasCookies:true} gibi); o kopya
+// dolu görünür ama işe yaramaz. Kurala böyle bir kopya kaydedildiğinde
+// sunucu gerçek kimliğe hiç bakmadan "giriş bilgisi yok" diyordu.
+function isUsableTwitterCredential(c) {
+  if (!c) return false;
+  return (Array.isArray(c.cookies) && c.cookies.length > 0)
+      || !!(c.consumerKey && c.consumerSecret);
+}
+
+// Kimlik bilgisinin tek doğru kaynağı hesap deposu. Kuralda saklı olan
+// yalnızca kullanılabilir durumdaysa (eski kurallar) ona düşüyoruz.
+function resolveTwitterCredentials(target) {
+  const byId = accountsStore.get(target.accountId)?.credentials;
+  if (isUsableTwitterCredential(byId)) return byId;
+
+  const handle = String(target.name || '').replace(/^@/, '').toLowerCase();
+  const byName = [...accountsStore.values()].find(a =>
+    a.platform === 'twitter' &&
+    [a.name, a.username, a.credentials?.username]
+      .some(v => String(v || '').replace(/^@/, '').toLowerCase() === handle));
+  if (isUsableTwitterCredential(byName?.credentials)) return byName.credentials;
+
+  if (isUsableTwitterCredential(target.credentials)) return target.credentials;
+  return {};
+}
+
 function targetLabel(t) {
   const p = PLATFORMS[t.platform];
   return `${p?.icon || ''} ${t.name || t.chatId || t.platform}`.trim();
@@ -2178,12 +2234,7 @@ async function deliverToTarget(target, post, rule) {
   try {
     switch (target.platform) {
       case 'twitter': {
-        // Giriş bilgisi artık tarayıcıya gönderilmediği için kuralda da
-        // olmayabilir; hesap kimliğinden sunucudaki kaydı çözüyoruz.
-        const c = target.credentials
-          || accountsStore.get(target.accountId)?.credentials
-          || [...accountsStore.values()].find(a => a.platform === 'twitter' && a.name === target.name)?.credentials
-          || {};
+        const c = resolveTwitterCredentials(target);
         if (Array.isArray(c.cookies) && c.cookies.length > 0) {
           const r = await postTweetViaCookies(c.cookies, post.text, post.media, opts.replyMode || rule.replyMode);
           return { success: r.success, error: r.error };
@@ -2561,8 +2612,23 @@ const saved = await loadState();
 for (const s of saved.sessions) {
   tgActiveSessions.set(s.accountId, { ...s, client: null });
 }
+// Bir dönem tarayıcıdan gelen sansürlü kimlik nesneleri kurallara
+// kaydedildi; bunlar dolu görünüp gönderimi engelliyor. Açılışta temizliyoruz
+// ki kullanıcı kuralları elle düzenlemek zorunda kalmasın.
+let repairedRules = 0;
 for (const r of saved.rules) {
-  syncRulesStore.set(r.id, r);
+  const targets = (r.targets || []).map(t => {
+    if (t.credentials && !isUsableTwitterCredential(t.credentials)) {
+      const { credentials, hasCredentials, ...rest } = t;
+      repairedRules++;
+      return rest;
+    }
+    return t;
+  });
+  syncRulesStore.set(r.id, { ...r, targets });
+}
+if (repairedRules) {
+  console.log(`[Kurallar] ${repairedRules} hedefte işe yaramaz giriş bilgisi temizlendi; kimlik hesap deposundan çözülecek.`);
 }
 for (const [ruleId, cursor] of Object.entries(saved.cursors || {})) {
   sourceCursors.set(ruleId, cursor);
