@@ -7,7 +7,7 @@ import fs from 'fs';
 import { createStore } from './storage.js';
 import {
   PLATFORMS, postToTelegram, parseTelegramTarget, downloadMedia,
-  fetchTwitterTimeline, twitterItemToPost, parseTwitterHandle,
+  fetchTwitterTimeline, twitterItemToPost, parseTwitterHandle, twitterRateStatus,
 } from './connectors.js';
 import {
   instagramAuthUrl, instagramExchangeCode, instagramRefreshToken, instagramProfile,
@@ -2498,19 +2498,34 @@ async function pollMetaSource(rule) {
   }
 }
 
+let polling = false;
+
 async function pollAllSources() {
-  for (const rule of syncRulesStore.values()) {
-    if (!rule.enabled) continue;
-    try {
-      if (rule.sourcePlatform === 'twitter') await pollTwitterSource(rule);
-      else if (rule.sourcePlatform === 'instagram' || rule.sourcePlatform === 'facebook') {
-        await pollMetaSource(rule);
+  // Bir tur bitmeden ikincisi başlarsa istekler ikiye katlanır ve hız
+  // sınırına daha hızlı gidilir.
+  if (polling) return;
+  polling = true;
+  try {
+    for (const rule of syncRulesStore.values()) {
+      if (!rule.enabled) continue;
+      try {
+        if (rule.sourcePlatform === 'twitter') await pollTwitterSource(rule);
+        else if (rule.sourcePlatform === 'instagram' || rule.sourcePlatform === 'facebook') {
+          await pollMetaSource(rule);
+        }
+      } catch (e) {
+        console.error(`[Yoklayıcı] ${rule.title} hatası:`, e.message);
       }
-    } catch (e) {
-      console.error(`[Yoklayıcı] ${rule.title} hatası:`, e.message);
     }
+  } finally {
+    polling = false;
   }
 }
+
+// X'in ne durumda olduğunu arayüzden görebilmek için.
+app.get('/api/source/rate-status', (_req, res) => {
+  res.json({ success: true, twitter: twitterRateStatus() });
+});
 
 setInterval(() => { pollAllSources().catch(() => {}); }, POLL_INTERVAL_MS).unref?.();
 
@@ -2521,15 +2536,15 @@ setInterval(() => { pollAllSources().catch(() => {}); }, POLL_INTERVAL_MS).unref
 const twitterHealth = new Map(); // hesap adı -> { ok, username, checkedAt, error }
 const HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
+// Kimlik artık kurallarda değil hesap deposunda; sağlık kontrolü de oradan
+// okumalı. Kuralları taramaya devam etseydi hiçbir hesabı göremezdi.
 function connectedTwitterAccounts() {
   const seen = new Map();
-  for (const rule of syncRulesStore.values()) {
-    for (const acc of ruleTargets(rule)) {
-      if (acc.platform !== 'twitter') continue;
-      const cookies = acc.credentials?.cookies;
-      if (Array.isArray(cookies) && cookies.length && !seen.has(acc.name)) {
-        seen.set(acc.name, cookies);
-      }
+  for (const acc of accountsStore.values()) {
+    if (acc.platform !== 'twitter') continue;
+    const cookies = acc.credentials?.cookies;
+    if (Array.isArray(cookies) && cookies.length) {
+      seen.set(acc.name || acc.username || acc.id, cookies);
     }
   }
   return seen;

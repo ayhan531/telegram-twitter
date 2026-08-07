@@ -563,8 +563,10 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
                     <div>
                       <div className="flex items-center space-x-1.5">
                         <p className="text-xs font-bold text-white">{acc.name}</p>
+                        {/* Çerezler artık tarayıcıya gönderilmiyor; sunucu
+                            hangi yöntemin kullanıldığını işaretle bildiriyor. */}
                         <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 border border-emerald-500/30 font-bold">
-                          {acc.credentials?.authToken ? 'XActions Sınırsız' : 'API Key'}
+                          {acc.credentials?.hasCookies ? 'Çerez · Sınırsız' : 'API Key'}
                         </span>
                       </div>
                       <p className="text-[11px] text-sky-400">{acc.username}</p>

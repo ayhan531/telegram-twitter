@@ -172,33 +172,81 @@ function pickVideoUrl(m) {
   return variants.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0].url;
 }
 
-// Uç nokta hız sınırlı (HTTP 429). Sınıra takılan hesabı bir süre hiç
-// yoklamıyoruz; yoksa her turda tekrar vurup sınırı uzatırdık.
-const twitterCooldown = new Map(); // handle -> ne zamana kadar beklenecek
-const TWITTER_COOLDOWN_MS = 15 * 60 * 1000;
+// X bu uca IP başına sert hız sınırı uyguluyor ve sınır aşıldığında TÜM
+// hesaplar için geliyor. Bu yüzden koruma üç katmanlı:
+//   1. Aynı hesabı izleyen birden çok kural tek isteği paylaşır (önbellek)
+//   2. İstekler sıraya girer, aralarında en az bir bekleme olur
+//   3. 429 gelince hesap bazında değil GENEL geri çekilme yapılır
+const TWITTER_CACHE_MS   = 90 * 1000;   // aynı hesap için yanıt ömrü
+const TWITTER_MIN_GAP_MS = 4000;        // iki istek arası asgari boşluk
+const TWITTER_BACKOFF_BASE_MS = 15 * 60 * 1000;
 
-export async function fetchTwitterTimeline(handleRaw) {
+const twitterCache = new Map();  // handle -> { at, items }
+let twitterBackoffUntil = 0;
+let twitterBackoffLevel = 0;
+let twitterLastRequest = 0;
+let twitterQueue = Promise.resolve();
+
+// İstekleri seri hâle getirip aralarına boşluk koyuyoruz. Paralel giden
+// onlarca istek sınırı anında tetikliyordu.
+function throttled(fn) {
+  const run = twitterQueue.then(async () => {
+    const wait = TWITTER_MIN_GAP_MS - (Date.now() - twitterLastRequest);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    twitterLastRequest = Date.now();
+    return fn();
+  });
+  // Kuyruğun bir hatada kopmaması için zinciri temiz tutuyoruz.
+  twitterQueue = run.then(() => {}, () => {});
+  return run;
+}
+
+export function twitterRateStatus() {
+  return {
+    backingOff: Date.now() < twitterBackoffUntil,
+    resumesInSec: Math.max(0, Math.ceil((twitterBackoffUntil - Date.now()) / 1000)),
+    level: twitterBackoffLevel,
+    cachedHandles: twitterCache.size,
+  };
+}
+
+export async function fetchTwitterTimeline(handleRaw, { allowCache = true } = {}) {
   const handle = parseTwitterHandle(handleRaw);
   if (!handle) throw new Error(`X hesabı anlaşılamadı: "${handleRaw}". @kullaniciadi veya x.com/kullaniciadi girin.`);
+  const key = handle.toLowerCase();
 
-  const until = twitterCooldown.get(handle.toLowerCase());
-  if (until && Date.now() < until) {
-    const mins = Math.ceil((until - Date.now()) / 60000);
-    throw new Error(`X hız sınırı: @${handle} için ${mins} dakika bekleniyor.`);
+  const cached = twitterCache.get(key);
+  if (allowCache && cached && Date.now() - cached.at < TWITTER_CACHE_MS) {
+    return cached.items;
   }
 
-  const res = await fetch(SYNDICATION_URL + encodeURIComponent(handle), {
+  if (Date.now() < twitterBackoffUntil) {
+    // Elimizde bayat da olsa veri varsa hata yerine onu veriyoruz; yoksa
+    // ne kadar bekleneceğini söylüyoruz.
+    if (cached) return cached.items;
+    const mins = Math.ceil((twitterBackoffUntil - Date.now()) / 60000);
+    throw new Error(`X hız sınırı: ${mins} dakika bekleniyor.`);
+  }
+
+  const res = await throttled(() => fetch(SYNDICATION_URL + encodeURIComponent(handle), {
     headers: { 'User-Agent': BROWSER_UA_C, 'Accept-Language': 'en-US,en;q=0.9' },
-  });
+  }));
 
   if (res.status === 429) {
-    twitterCooldown.set(handle.toLowerCase(), Date.now() + TWITTER_COOLDOWN_MS);
-    throw new Error(`X hız sınırına takıldı (@${handle}). 15 dakika beklenecek.`);
+    // Sınır IP bazlı olduğu için tek hesabı değil hepsini durduruyoruz ve
+    // üst üste yenilirse bekleme süresini katlıyoruz.
+    twitterBackoffLevel = Math.min(twitterBackoffLevel + 1, 4);
+    twitterBackoffUntil = Date.now() + TWITTER_BACKOFF_BASE_MS * twitterBackoffLevel;
+    const mins = Math.round(TWITTER_BACKOFF_BASE_MS * twitterBackoffLevel / 60000);
+    if (cached) return cached.items;
+    throw new Error(`X hız sınırına takıldı. ${mins} dakika beklenecek.`);
   }
   if (!res.ok) throw new Error(`X profili okunamadı (HTTP ${res.status})`);
-  twitterCooldown.delete(handle.toLowerCase());
 
-  return parseSyndicationHtml(await res.text(), handle);
+  twitterBackoffLevel = 0;
+  const items = parseSyndicationHtml(await res.text(), handle);
+  twitterCache.set(key, { at: Date.now(), items });
+  return items;
 }
 
 export function parseSyndicationHtml(html, handle = '') {
