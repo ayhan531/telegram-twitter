@@ -1511,25 +1511,34 @@ async function createTweetRequest(cookieMap, op, text, mediaIds, replyMode = 'ev
 const SEND_MIN_GAP_MS = 30 * 1000;
 const SOFT_DROP_RETRY_DELAYS = [90 * 1000, 240 * 1000];
 
-let lastSendAt = 0;
-let sendChain = Promise.resolve();
+// Kuyruk HESAP BAŞINA tutuluyor. Tek bir global kuyruk, X'in sınırı hesap
+// bazlı olmasına rağmen bütün hesapları birbirini beklettiriyordu: 10 hesaba
+// 10 tweet atmak 5 dakika sürüyordu. Artık farklı hesaplar aynı anda gönderiyor,
+// aynı hesabın gönderileri arasında ise 30 sn korunuyor.
+const sendQueues = new Map(); // hesap anahtarı -> { chain, lastSendAt }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function enqueueSend(task) {
-  const queued = sendChain.then(async () => {
-    const wait = lastSendAt + SEND_MIN_GAP_MS - Date.now();
+function enqueueSend(task, accountKey = 'default') {
+  let q = sendQueues.get(accountKey);
+  if (!q) {
+    q = { chain: Promise.resolve(), lastSendAt: 0 };
+    sendQueues.set(accountKey, q);
+  }
+
+  const queued = q.chain.then(async () => {
+    const wait = q.lastSendAt + SEND_MIN_GAP_MS - Date.now();
     if (wait > 0) {
-      console.log(`[Twitter] Kuyruk: X hız sınırına takılmamak için ${Math.ceil(wait / 1000)} sn bekleniyor.`);
+      console.log(`[Twitter] ${accountKey}: X hız sınırına takılmamak için ${Math.ceil(wait / 1000)} sn bekleniyor.`);
       await sleep(wait);
     }
     try {
       return await task();
     } finally {
-      lastSendAt = Date.now();
+      q.lastSendAt = Date.now();
     }
   });
-  sendChain = queued.then(() => {}, () => {});
+  q.chain = queued.then(() => {}, () => {});
   return queued;
 }
 
@@ -1554,6 +1563,9 @@ async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'e
   if (!text && !mediaData.length) {
     return { success: false, error: 'Tweet metni ve medya birlikte boş olamaz.' };
   }
+
+  // Kuyruk anahtarı hesabın kendi oturumu: farklı hesaplar birbirini beklemez.
+  const accountKey = cookieMap.get('auth_token').slice(-12);
 
   return enqueueSend(async () => {
     try {
@@ -1605,7 +1617,7 @@ async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'e
       console.error('[Twitter] Tweet gönderim hatası:', raw);
       return { success: false, error: raw };
     }
-  });
+  }, accountKey);
 }
 
 app.post('/api/twitter/send', async (req, res) => {
@@ -2357,11 +2369,13 @@ async function executeSyncRule(rule, post) {
   }
 
   const outgoing = { ...post, text };
-  const results = [];
-  for (const target of targets) {
+  // Hedefler paralel gidiyor: X'e giden bir gönderi kuyrukta beklerken
+  // Telegram ve Instagram'ın da beklemesi için sebep yok. Aynı hesaba giden
+  // gönderiler zaten hesap bazlı kuyrukta sıralanıyor.
+  const results = await Promise.all(targets.map(async (target) => {
     const r = await deliverToTarget(target, outgoing, rule);
-    results.push({ account: targetLabel(target), ...r });
-  }
+    return { account: targetLabel(target), ...r };
+  }));
 
   const failCount = results.filter(r => !r.success).length;
   pushSyncLog({
