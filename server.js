@@ -1925,6 +1925,44 @@ app.post('/api/meta/:accountId/publish', async (req, res) => {
   }
 });
 
+// "Şu hesaptaki şu kanaldan mesaj gelse hangi kurallar çalışır, nereye gider?"
+// Dinleyicinin kullandığı eşleştirme fonksiyonunun ta kendisini çağırır.
+app.post('/api/rules/match-test', (req, res) => {
+  const { accountId, channel, senderUsername } = req.body || {};
+  if (!accountId) return res.status(400).json({ success: false, error: 'accountId gerekli.' });
+
+  const parsed = parseTargetFilter(channel || '');
+  const chatUsername = parsed.type === 'username' ? parsed.value : null;
+  const chatId = parsed.type === 'id' ? parsed.value : null;
+
+  const rules = rulesForAccount(accountId);
+  const matched = matchRulesForMessage(rules, {
+    chatId, chatUsername,
+    senderId: null,
+    senderUsername: (senderUsername || '').replace(/^@/, '').toLowerCase() || null,
+  });
+
+  return res.json({
+    success: true,
+    accountId,
+    channelParsed: parsed,
+    totalRulesForAccount: rules.length,
+    matched: matched.map(r => ({
+      id: r.id,
+      title: r.title,
+      channelFilter: r.sourceChannelId || '(tüm kanallar)',
+      targets: ruleTargets(r).map(t => `${PLATFORMS[t.platform]?.icon || ''} ${t.name || t.chatId || t.platform}`),
+    })),
+    skipped: rules.filter(r => !matched.includes(r)).map(r => ({
+      title: r.title,
+      channelFilter: r.sourceChannelId || '(tüm kanallar)',
+      reason: parseTargetFilter(r.sourceChannelId).type === 'invalid'
+        ? 'Kanal filtresi anlaşılamadı'
+        : 'Kanal filtresi eşleşmedi',
+    })),
+  });
+});
+
 // Kaynağın gerçekten okunabildiğini kural kaydetmeden önce görebilmek için.
 app.post('/api/source/preview', async (req, res) => {
   const { platform, handle } = req.body || {};
@@ -2113,6 +2151,28 @@ function matchesTarget(filter, id, username, label) {
   return !!username && username === filter.value;
 }
 
+// Bir hesabın etkin kuralları.
+function rulesForAccount(accountId) {
+  return [...syncRulesStore.values()].filter(r => r.enabled && r.sourceAccountId === accountId);
+}
+
+// Gelen bir mesajın hangi kurallara uyduğunu bulur.
+//
+// Dinleyici ve tanılama ucu AYNI fonksiyonu kullanıyor: aksi hâlde tanılama
+// "çalışıyor" derken gerçek akış başka davranabilirdi.
+function matchRulesForMessage(rules, { chatId, chatUsername, senderId, senderUsername }) {
+  return rules.filter((rule) => {
+    const channel = parseTargetFilter(rule.sourceChannelId);
+    if (!matchesTarget(channel, chatId, chatUsername, `${rule.title} kanal filtresi`)) return false;
+
+    const senderF = parseTargetFilter(rule.sourceSenderId);
+    if (senderF.type !== 'all') {
+      if (!matchesTarget(senderF, senderId, senderUsername, `${rule.title} gönderen filtresi`)) return false;
+    }
+    return true;
+  });
+}
+
 // Gönderen kimliği/kullanıcı adı. Kanallarda gönderi kanalın kendisine aittir;
 // gruplarda gerçek kullanıcıya. İkisini de destekliyoruz.
 async function messageSenderInfo(msg) {
@@ -2192,21 +2252,18 @@ async function startTelegramListener(accountId) {
       const rawText = msg.text || msg.message || '';
       console.log(`[Telegram] Yeni mesaj geldi (Chat: ${chatId}): ${rawText.slice(0, 60)}`);
 
-      const accountRules = [...syncRulesStore.values()].filter(
-        r => r.enabled && r.sourceAccountId === accountId
-      );
-
+      const accountRules = rulesForAccount(accountId);
       if (!accountRules.length) {
         console.log('[Telegram] Bu hesap için etkin kural yok, mesaj atlandı.');
         return;
       }
 
-      const channelFilters = accountRules.map(r => parseTargetFilter(r.sourceChannelId));
-      const senderFilters  = accountRules.map(r => parseTargetFilter(r.sourceSenderId));
+      const needsChatName = accountRules.some(r => parseTargetFilter(r.sourceChannelId).type === 'username');
+      const needsSender   = accountRules.some(r => parseTargetFilter(r.sourceSenderId).type !== 'all');
 
       // Kullanıcı adına göre eşleşme istenmişse kanal/gönderen bilgisini çekiyoruz.
       let chatUsername = null;
-      if (channelFilters.some(f => f.type === 'username')) {
+      if (needsChatName) {
         try {
           const chat = await msg.getChat();
           chatUsername = (chat?.username || '').toLowerCase() || null;
@@ -2215,21 +2272,14 @@ async function startTelegramListener(accountId) {
         }
       }
 
-      let sender = null;
-      if (senderFilters.some(f => f.type !== 'all')) {
-        sender = await messageSenderInfo(msg);
-      }
+      const sender = needsSender ? await messageSenderInfo(msg) : null;
 
-      const matchingRules = accountRules.filter((rule, i) => {
-        if (!matchesTarget(channelFilters[i], chatId, chatUsername, `${rule.title} kanal filtresi`)) return false;
-        if (senderFilters[i].type !== 'all') {
-          if (!matchesTarget(senderFilters[i], sender?.senderId, sender?.username, `${rule.title} gönderen filtresi`)) return false;
-        }
-        return true;
+      const matchingRules = matchRulesForMessage(accountRules, {
+        chatId, chatUsername, senderId: sender?.senderId, senderUsername: sender?.username,
       });
 
       if (!matchingRules.length) {
-        console.log(`[Telegram] Chat ${chatId} hiçbir kuralın kanal filtresine uymadı, atlandı.`);
+        console.log(`[Telegram] Chat ${chatId}${chatUsername ? ' (@' + chatUsername + ')' : ''} hiçbir kuralın kanal filtresine uymadı, atlandı.`);
         return;
       }
 
