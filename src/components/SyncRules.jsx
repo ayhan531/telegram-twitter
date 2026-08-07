@@ -114,18 +114,25 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
 
   const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
 
+  // İkinci hedefi eklerken zaten kullanılan hesabı tekrar seçmek yerine
+  // sıradaki boşta olanı öneriyoruz: C ve D'yi arka arkaya eklemek yetiyor.
+  const firstUnused = (list, idOf = a => a.id) => {
+    const used = new Set((form.targets || []).filter(t => t.platform).map(t => t.accountId));
+    return list.find(a => !used.has(idOf(a))) || list[0];
+  };
+
   const addTarget = (platform) => {
     const base = { platform, options: {} };
     if (platform === 'twitter') {
-      const a = twitterAccounts[0];
+      const a = firstUnused(twitterAccounts);
       if (!a) return alert('Önce X hesabı bağlamalısın (Bağlantılar sekmesi).');
-      Object.assign(base, { name: a.name, accountId: a.id, credentials: a.credentials, options: { replyMode: 'everyone' } });
+      Object.assign(base, { name: a.name, accountId: a.id, options: { replyMode: 'everyone' } });
     } else if (platform === 'telegram') {
-      const a = telegramAccounts[0];
+      const a = firstUnused(telegramAccounts, a => a.credentials?.accountId || a.id);
       if (!a) return alert('Önce Telegram hesabı bağlamalısın.');
       Object.assign(base, { name: a.name, accountId: a.credentials?.accountId || a.id, chatId: '' });
     } else if (platform === 'instagram') {
-      const a = igAccounts[0];
+      const a = firstUnused(igAccounts);
       if (!a) return alert('Önce Instagram hesabı bağlamalısın.');
       Object.assign(base, { name: `@${a.username}`, accountId: a.id, options: { kind: 'post', disableComments: false } });
     } else if (platform === 'facebook') {
@@ -331,12 +338,24 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
             </div>
 
             {t.platform === 'twitter' && (
-              <select value={t.options.replyMode} onChange={e => updateTarget(i, { options: { replyMode: e.target.value } })} className={selectCls}>
-                <option value="everyone">💬 Yanıtlar: Herkes</option>
-                <option value="following">👥 Yanıtlar: Takip ettiklerin</option>
-                <option value="mentioned">📣 Yanıtlar: Yalnızca bahsettiklerin</option>
-                <option value="verified">✅ Yanıtlar: Onaylanmış hesaplar</option>
-              </select>
+              <>
+                {/* Hangi X hesabına gideceği seçilebilmeli; eskiden her zaman
+                    ilk hesap kullanılıyordu ve ikincisi hiç seçilemiyordu. */}
+                <select value={t.accountId} onChange={e => {
+                  const a = twitterAccounts.find(x => x.id === e.target.value);
+                  updateTarget(i, { accountId: e.target.value, name: a?.name || a?.username });
+                }} className={selectCls}>
+                  {twitterAccounts.map(a => (
+                    <option key={a.id} value={a.id}>𝕏 {a.name} ({a.username})</option>
+                  ))}
+                </select>
+                <select value={t.options.replyMode} onChange={e => updateTarget(i, { options: { replyMode: e.target.value } })} className={selectCls}>
+                  <option value="everyone">💬 Yanıtlar: Herkes</option>
+                  <option value="following">👥 Yanıtlar: Takip ettiklerin</option>
+                  <option value="mentioned">📣 Yanıtlar: Yalnızca bahsettiklerin</option>
+                  <option value="verified">✅ Yanıtlar: Onaylanmış hesaplar</option>
+                </select>
+              </>
             )}
 
             {t.platform === 'telegram' && (
