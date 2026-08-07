@@ -355,6 +355,14 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
                   <option value="mentioned">📣 Yanıtlar: Yalnızca bahsettiklerin</option>
                   <option value="verified">✅ Yanıtlar: Onaylanmış hesaplar</option>
                 </select>
+                <label className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                  <input type="checkbox" checked={!!t.options.longText}
+                    onChange={e => updateTarget(i, { options: { longText: e.target.checked } })} />
+                  ✨ Bu hesap Premium — uzun gönderi (25.000 karaktere kadar)
+                </label>
+                <p className="text-[10px] text-slate-500">
+                  İşaretlemezsen metin 280 karakterde kesilir. Premium değilse X uzun gönderiyi reddeder.
+                </p>
               </>
             )}
 

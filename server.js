@@ -1159,7 +1159,6 @@ const FALLBACK_OP = {
 
 // Keşfedilen operasyon 6 saat önbelleklenir; X kimliği değiştirirse bir sonraki
 // yenilemede ya da 404 alındığında anında tazelenir.
-let opCache = { op: null, fetchedAt: 0 };
 const OP_CACHE_MS = 6 * 60 * 60 * 1000;
 
 function parseCookieMap(input) {
@@ -1350,42 +1349,58 @@ async function verifyTwitterCookies(cookieMap) {
   return { username: screenName, name: screenName, userId, html: page.html };
 }
 
-// CreateTweet operasyonunu X'in web paketinden okur (sorgu kimliği + feature listesi).
-async function discoverCreateTweetOp(cookieMap, force = false) {
-  if (!force && opCache.op && Date.now() - opCache.fetchedAt < OP_CACHE_MS) {
-    return opCache.op;
+// X, 280 karakteri aşan Premium gönderileri ayrı bir uçtan alıyor
+// (CreateNoteTweet). Aynı değişken yapısını kullanıyor, yalnızca operasyon
+// adı ve sorgu kimliği farklı.
+const NOTE_TWEET_OP = 'CreateNoteTweet';
+const FALLBACK_NOTE_QUERY_ID = 'WCcsCWTsiPteFwUxjI6OmA';
+const opCaches = new Map(); // operasyon adı -> { op, fetchedAt }
+
+// Operasyon tanımını X'in kendi web paketinden okur (sorgu kimliği + feature).
+async function discoverOp(cookieMap, opName = 'CreateTweet', force = false) {
+  const cached = opCaches.get(opName);
+  if (!force && cached && Date.now() - cached.fetchedAt < OP_CACHE_MS) {
+    return cached.op;
   }
+
+  const fallback = opName === NOTE_TWEET_OP
+    ? { ...FALLBACK_OP, queryId: FALLBACK_NOTE_QUERY_ID }
+    : FALLBACK_OP;
+
   try {
     const { html } = await fetchHomePage(cookieMap);
     const bundle = /https:\/\/abs\.twimg\.com\/responsive-web\/client-web\/main\.[0-9a-f]+\.js/.exec(html)?.[0];
     if (!bundle) throw new Error('main paketi bulunamadı');
 
     const js = await (await fetch(bundle, { headers: { 'User-Agent': BROWSER_UA } })).text();
-    const idx = js.indexOf('operationName:"CreateTweet"');
-    if (idx < 0) throw new Error('CreateTweet tanımı bulunamadı');
+    const marker = `operationName:"${opName}"`;
+    const idx = js.indexOf(marker);
+    if (idx < 0) throw new Error(`${opName} tanımı bulunamadı`);
 
     const segment = js.slice(Math.max(0, idx - 400), idx + 2000);
-    const queryId = /queryId:"([^"]+)",operationName:"CreateTweet"/.exec(segment)?.[1];
+    const queryId = new RegExp(`queryId:"([^"]+)",operationName:"${opName}"`).exec(segment)?.[1];
     if (!queryId) throw new Error('queryId okunamadı');
 
     const listOf = (label) => {
-      const m = new RegExp(`${label}:\\[([^\\]]*)\\]`).exec(segment.slice(segment.indexOf('operationName:"CreateTweet"')));
+      const m = new RegExp(`${label}:\\[([^\\]]*)\\]`).exec(segment.slice(segment.indexOf(marker)));
       return m ? [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]) : [];
     };
 
     const op = {
       queryId,
-      featureSwitches: listOf('featureSwitches').length ? listOf('featureSwitches') : FALLBACK_OP.featureSwitches,
-      fieldToggles: listOf('fieldToggles').length ? listOf('fieldToggles') : FALLBACK_OP.fieldToggles,
+      featureSwitches: listOf('featureSwitches').length ? listOf('featureSwitches') : fallback.featureSwitches,
+      fieldToggles: listOf('fieldToggles').length ? listOf('fieldToggles') : fallback.fieldToggles,
     };
-    opCache = { op, fetchedAt: Date.now() };
-    console.log(`[Twitter] CreateTweet sorgu kimliği güncellendi: ${queryId} (${op.featureSwitches.length} feature)`);
+    opCaches.set(opName, { op, fetchedAt: Date.now() });
+    console.log(`[Twitter] ${opName} sorgu kimliği güncellendi: ${queryId} (${op.featureSwitches.length} feature)`);
     return op;
   } catch (e) {
-    console.warn('[Twitter] Sorgu kimliği okunamadı, gömülü değer kullanılacak:', e.message);
-    return opCache.op || FALLBACK_OP;
+    console.warn(`[Twitter] ${opName} sorgu kimliği okunamadı, gömülü değer kullanılacak:`, e.message);
+    return cached?.op || fallback;
   }
 }
+
+const discoverCreateTweetOp = (cookieMap, force = false) => discoverOp(cookieMap, 'CreateTweet', force);
 
 // ─── Medya Yükleme (parçalı) ────────────────────────────────────────────────
 // X segment başına ~5 MB kabul ettiği için INIT → APPEND(xN) → FINALIZE akışını
@@ -1464,8 +1479,8 @@ const REPLY_MODES = {
   verified:  'Verified',     // Onaylanmış hesaplar
 };
 
-async function createTweetRequest(cookieMap, op, text, mediaIds, replyMode = 'everyone') {
-  const pathname = `/i/api/graphql/${op.queryId}/CreateTweet`;
+async function createTweetRequest(cookieMap, op, text, mediaIds, replyMode = 'everyone', opName = 'CreateTweet') {
+  const pathname = `/i/api/graphql/${op.queryId}/${opName}`;
   const txId = await clientTransactionId('POST', pathname);
   const variables = {
     tweet_text: text || '',
@@ -1542,20 +1557,33 @@ function enqueueSend(task, accountKey = 'default') {
   return queued;
 }
 
-async function attemptCreateTweet(cookieMap, text, mediaIds, replyMode) {
-  let op = await discoverCreateTweetOp(cookieMap);
-  let res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode);
+async function attemptCreateTweet(cookieMap, text, mediaIds, replyMode, longText = false) {
+  // 280'i aşan gönderiler normal uçtan reddedilir; Premium hesaplarda
+  // CreateNoteTweet kullanmak gerekiyor.
+  const opName = (longText && (text || '').length > 280) ? NOTE_TWEET_OP : 'CreateTweet';
+
+  let op = await discoverOp(cookieMap, opName);
+  let res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode, opName);
 
   // Sorgu kimliği eskimişse X 404 döner; kimliği tazeleyip bir kez daha deniyoruz.
   if (res.status === 404) {
-    console.warn('[Twitter] Sorgu kimliği eskimiş, yeniden keşfediliyor...');
-    op = await discoverCreateTweetOp(cookieMap, true);
-    res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode);
+    console.warn(`[Twitter] ${opName} sorgu kimliği eskimiş, yeniden keşfediliyor...`);
+    op = await discoverOp(cookieMap, opName, true);
+    res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode, opName);
+  }
+
+  // Uzun gönderi reddedilirse sessizce kaybetmek yerine kısaltıp gönderiyoruz.
+  if (opName === NOTE_TWEET_OP && res.status >= 400) {
+    console.warn('[Twitter] Uzun gönderi reddedildi, 280 karaktere kısaltılıp yeniden deneniyor.');
+    const short = fitText(text, 280);
+    const normalOp = await discoverOp(cookieMap, 'CreateTweet');
+    res = await createTweetRequest(cookieMap, normalOp, short, mediaIds, replyMode, 'CreateTweet');
+    res.truncatedFallback = true;
   }
   return res;
 }
 
-async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'everyone') {
+async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'everyone', longText = false) {
   const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
   if (!cookieMap.get('auth_token') || !cookieMap.get('ct0')) {
     return { success: false, error: 'Çerezler eksik (auth_token ve ct0 gerekli). Hesabı yeniden bağlayın.' };
@@ -1579,7 +1607,7 @@ async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'e
       }
 
       for (let attempt = 0; ; attempt++) {
-        const res = await attemptCreateTweet(cookieMap, text, mediaIds, replyMode);
+        const res = await attemptCreateTweet(cookieMap, text, mediaIds, replyMode, longText);
 
         const tweetId = res.data?.data?.create_tweet?.tweet_results?.result?.rest_id;
         if (tweetId) {
@@ -1933,27 +1961,61 @@ app.post('/api/source/preview', async (req, res) => {
   }
 });
 
-// ─── Format Tweet Text ──────────────────────────────────────────────────────
+// ─── Metin hazırlama ────────────────────────────────────────────────────────
+// Burada KISALTMA yapmıyoruz. Kısaltma platforma bağlı: X'te normal hesap 280,
+// Premium 25.000; Telegram 4096; Instagram 2200 karakter kabul ediyor. Ortak
+// yerde 270'e kırpmak Premium hesaplarda uzun gönderileri boşuna kesiyordu.
 function buildTweetText(rawText, rule) {
   let text = (rawText || '').trim();
   if (!text) return '';
 
-  // Banned keywords filter
   if (rule.bannedKeywords) {
     const banned = rule.bannedKeywords.split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
     if (banned.some(k => text.toLowerCase().includes(k))) return '';
   }
 
-  // Slice to max 270 chars
-  if (text.length > 270) text = text.slice(0, 267) + '...';
-
-  // Auto hashtags
   if (rule.autoHashtags) {
     const tags = rule.autoHashtags.split(',').map(t => t.trim().replace(/^#?/, '#')).filter(Boolean).join(' ');
-    if (text.length + tags.length + 1 <= 280) text += '\n' + tags;
+    if (tags) text += '\n' + tags;
   }
 
   return text;
+}
+
+// Platform sınırları. X Premium uzun gönderiye izin veriyor; hangi hesabın
+// Premium olduğunu bilemeyeceğimiz için bu hedef ayarından geliyor.
+const TEXT_LIMITS = {
+  twitter: 280,
+  twitterPremium: 25000,
+  telegram: 4096,
+  telegramCaption: 1024, // medya varsa açıklama sınırı daha düşük
+  instagram: 2200,
+  facebook: 63206,
+};
+
+// Kelimenin ortasından kesmemeye çalışıyoruz; sonuna "..." koyup sınırı aşmıyoruz.
+function fitText(text, limit) {
+  if (!text || text.length <= limit) return text;
+  const hard = text.slice(0, limit - 1);
+  const lastSpace = hard.lastIndexOf(' ');
+  const cut = lastSpace > limit * 0.6 ? hard.slice(0, lastSpace) : hard;
+  return cut.trimEnd() + '…';
+}
+
+function limitForTarget(target, hasMedia) {
+  const opts = target.options || {};
+  switch (target.platform) {
+    case 'twitter':
+      return opts.longText ? TEXT_LIMITS.twitterPremium : TEXT_LIMITS.twitter;
+    case 'telegram':
+      return hasMedia ? TEXT_LIMITS.telegramCaption : TEXT_LIMITS.telegram;
+    case 'instagram':
+      return TEXT_LIMITS.instagram;
+    case 'facebook':
+      return TEXT_LIMITS.facebook;
+    default:
+      return TEXT_LIMITS.twitter;
+  }
 }
 
 // ─── Telegram Media → Twitter Media ─────────────────────────────────────────
@@ -2243,12 +2305,22 @@ function targetLabel(t) {
 // Tek bir hedefe gönderim. Platform ne olursa olsun aynı Post biçimini alır.
 async function deliverToTarget(target, post, rule) {
   const opts = target.options || {};
+  // Metni hedefin kendi sınırına göre kısaltıyoruz: X Premium'a uzun gönderi
+  // giderken aynı içerik Instagram'a 2200 karakterle gidebiliyor.
+  const limit = limitForTarget(target, (post.media || []).length > 0);
+  const fitted = fitText(post.text || '', limit);
+  if (fitted !== post.text) {
+    console.log(`[Gönderim] ${target.platform} için metin ${limit} karaktere sığdırıldı (${(post.text || '').length} → ${fitted.length}).`);
+  }
+  post = { ...post, text: fitted };
+
   try {
     switch (target.platform) {
       case 'twitter': {
         const c = resolveTwitterCredentials(target);
         if (Array.isArray(c.cookies) && c.cookies.length > 0) {
-          const r = await postTweetViaCookies(c.cookies, post.text, post.media, opts.replyMode || rule.replyMode);
+          const r = await postTweetViaCookies(
+            c.cookies, post.text, post.media, opts.replyMode || rule.replyMode, !!opts.longText);
           return { success: r.success, error: r.error };
         }
         if (c.consumerKey && c.consumerSecret) {
