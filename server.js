@@ -152,7 +152,41 @@ const accountsStore    = new Map(); // accountId -> arayüzün gördüğü hesap
 const tempMedia        = new Map(); // token -> { buffer, mediaType, expiresAt }
 const tgActiveSessions = new Map(); // accountId -> { client, sessionString, accountName, apiId, apiHash }
 const syncRulesStore   = new Map(); // ruleId -> rule object
-const recentlySynced   = new Set(); // messageId -> to prevent duplicate tweets
+// Aynı mesajın iki kez paylaşılmasını engeller.
+//
+// Telegram bağlantı koptuğunda kaçırılan güncellemeleri yeniden gönderiyor
+// (getDifference). Pencere 60 saniyeydi; 4-5 dakika sonra gelen tekrar
+// süzgeçten geçip aynı tweet'i bir daha atıyordu. Pencereyi uzatıp diske
+// yazıyoruz ki yeniden başlatma da tekrarı engellesin.
+const recentlySynced   = new Map(); // anahtar -> son geçerlilik zamanı
+const DEDUPE_TTL_MS    = 24 * 60 * 60 * 1000;
+
+function alreadyHandled(key) {
+  const until = recentlySynced.get(key);
+  if (until && Date.now() < until) return true;
+  recentlySynced.set(key, Date.now() + DEDUPE_TTL_MS);
+  return false;
+}
+
+// İçerik bazlı ikinci süzgeç. Mesaj kimliği değişse bile aynı metnin kısa
+// süre içinde tekrar gitmesini engeller.
+const recentContent    = new Map(); // kural+içerik özeti -> geçerlilik sonu
+const CONTENT_DEDUPE_MS = 30 * 60 * 1000;
+
+function pruneDedupe() {
+  const now = Date.now();
+  for (const [k, until] of recentlySynced) if (now > until) recentlySynced.delete(k);
+  for (const [k, until] of recentContent) if (now > until) recentContent.delete(k);
+  // Aşırı büyümeye karşı üst sınır: en eskiden başlayarak kırpıyoruz.
+  if (recentlySynced.size > 20000) {
+    const excess = recentlySynced.size - 20000;
+    let i = 0;
+    for (const k of recentlySynced.keys()) {
+      if (i++ >= excess) break;
+      recentlySynced.delete(k);
+    }
+  }
+}
 const syncLog          = [];        // audit trail for auto-sync activity
 
 // ─── Disk persistence ────────────────────────────────────────────────────────
@@ -195,6 +229,9 @@ function collectState() {
     meta: [...metaAccounts.values()],
     accounts: [...accountsStore.values()],
     settings: appSettings,
+    // Yeniden başlatmadan sonra Telegram kaçırılan mesajları tekrar gönderir;
+    // bu liste olmadan hepsi yeniden paylaşılırdı.
+    handled: [...recentlySynced.entries()].filter(([, until]) => until > Date.now()),
     savedAt: new Date().toISOString(),
   };
 }
@@ -229,7 +266,7 @@ function saveState() {
   }, 2000);
 }
 
-const EMPTY_STATE = { sessions: [], rules: [], cursors: {}, meta: [], accounts: [], settings: {} };
+const EMPTY_STATE = { sessions: [], rules: [], cursors: {}, meta: [], accounts: [], settings: {}, handled: [] };
 
 async function loadState() {
   if (!store) return { ...EMPTY_STATE };
@@ -240,6 +277,7 @@ async function loadState() {
       sessions: parsed.sessions || [], rules: parsed.rules || [],
       cursors: parsed.cursors || {}, meta: parsed.meta || [],
       accounts: parsed.accounts || [], settings: parsed.settings || {},
+      handled: parsed.handled || [],
     };
   } catch (e) {
     console.error('[Depolama] Yüklenemedi:', e.message);
@@ -1609,7 +1647,13 @@ async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'e
       for (let attempt = 0; ; attempt++) {
         const res = await attemptCreateTweet(cookieMap, text, mediaIds, replyMode, longText);
 
-        const tweetId = res.data?.data?.create_tweet?.tweet_results?.result?.rest_id;
+        // Yanıt anahtarı uca göre değişiyor: normal gönderide create_tweet,
+        // uzun (Premium) gönderide notetweet_create. Yalnızca create_tweet'e
+        // bakmak, BAŞARIYLA atılmış uzun tweet'leri hata sanmamıza ve aynı
+        // içeriği tekrar göndermemize yol açıyordu.
+        const payload = res.data?.data || {};
+        const resultNode = payload.create_tweet || payload.notetweet_create || null;
+        const tweetId = resultNode?.tweet_results?.result?.rest_id;
         if (tweetId) {
           console.log('[Twitter] Tweet gönderildi! ID:', tweetId);
           return { success: true, tweetId };
@@ -1617,7 +1661,7 @@ async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'e
 
         const err = res.data?.errors?.[0];
         // Hatasız 200 + boş tweet_results = X sessizce düşürdü (hız/spam koruması).
-        const softDrop = res.status === 200 && !err && res.data?.data?.create_tweet;
+        const softDrop = res.status === 200 && !err && !!resultNode;
 
         if (softDrop && attempt < SOFT_DROP_RETRY_DELAYS.length) {
           const delay = SOFT_DROP_RETRY_DELAYS[attempt];
@@ -1766,13 +1810,32 @@ app.get('/api/sync/logs', (_req, res) => {
 });
 
 // Manual rule execution test (sends a test tweet immediately)
+//
+// `viaRule: true` verilirse gerçek kural boru hattı çalıştırılır (tekrar
+// süzgeci, filtreler, log kaydı dahil). Varsayılan doğrudan gönderimdir,
+// böylece test düğmesiyle aynı metni istediğin kadar deneyebilirsin.
 app.post('/api/sync/test', async (req, res) => {
-  const { ruleId, text } = req.body;
+  const { ruleId, text, viaRule } = req.body;
   const rule = syncRulesStore.get(ruleId);
   if (!rule) return res.status(404).json({ success: false, error: 'Kural bulunamadı.' });
 
   const targets = ruleTargets(rule);
   if (!targets.length) return res.status(400).json({ success: false, error: 'Kurala hedef hesap eklenmemiş.' });
+
+  if (viaRule) {
+    const before = syncLog.length;
+    await executeSyncRule(rule, {
+      text: text || `⚡ OmniSync boru hattı testi [${new Date().toLocaleTimeString('tr-TR')}]`,
+      media: [], sourceLabel: 'Test',
+    });
+    const entry = syncLog.length > before ? syncLog[0] : null;
+    return res.json({
+      success: entry?.status === 'success',
+      status: entry?.status || 'unknown',
+      details: entry?.details || null,
+      pipeline: true,
+    });
+  }
 
   const testText = text || `⚡ OmniSync Test Gönderisi [${new Date().toLocaleTimeString('tr-TR')}]`;
   const formattedText = buildTweetText(testText, rule);
@@ -2243,9 +2306,10 @@ async function startTelegramListener(accountId) {
       // Mesaj numaraları kanal bazında artar; anahtara kanalı da katmazsak
       // farklı kanallardaki aynı numaralı mesajlar birbirini eler.
       const msgKey = `${accountId}:${chatId}:${msg.id}`;
-      if (recentlySynced.has(msgKey)) return;
-      recentlySynced.add(msgKey);
-      setTimeout(() => recentlySynced.delete(msgKey), 60000);
+      if (alreadyHandled(msgKey)) {
+        console.log(`[Telegram] Mesaj ${msgKey} daha önce işlendi, atlandı (tekrar gönderim).`);
+        return;
+      }
       // MTProto'da medya açıklaması da .message alanındadır; Bot API'deki
       // "caption" burada yoktur. .text getter'ı istemci bağlı değilse boş döner,
       // bu yüzden ham .message alanına da düşüyoruz.
@@ -2489,6 +2553,26 @@ async function executeSyncRule(rule, post) {
     });
     return;
   }
+
+  // İkinci emniyet: mesaj kimliği değişse bile (Telegram bazı durumlarda
+  // aynı içeriği yeni kimlikle gönderiyor) aynı kurala giden aynı metni
+  // kısa süre içinde tekrar paylaşmıyoruz. Pencere dar tutuldu ki gerçek
+  // tekrar paylaşımlar engellenmesin.
+  const contentKey = `${rule.id}:${crypto.createHash('sha1')
+    .update(text + '|' + media.map(m => m.data.length).join(','))
+    .digest('hex')}`;
+  if (recentContent.get(contentKey) > Date.now()) {
+    pushSyncLog({
+      source: `${sourceLabel} → ${rule.title}`,
+      messagePreview: text.slice(0, 80),
+      targets: targets.map(targetLabel),
+      status: 'filtered',
+      details: 'Aynı içerik az önce paylaşıldı, tekrar gönderilmedi.',
+    });
+    console.log(`[Kural] ${rule.title}: aynı içerik az önce gönderilmişti, atlandı.`);
+    return;
+  }
+  recentContent.set(contentKey, Date.now() + CONTENT_DEDUPE_MS);
 
   const outgoing = { ...post, text };
   // Hedefler paralel gidiyor: X'e giden bir gönderi kuyrukta beklerken
@@ -2790,6 +2874,9 @@ for (const a of saved.meta || []) {
 for (const a of saved.accounts || []) {
   accountsStore.set(a.id, a);
 }
+for (const [key, until] of saved.handled || []) {
+  if (until > Date.now()) recentlySynced.set(key, until);
+}
 appSettings = saved.settings || {};
 
 console.log(`[Depolama] ${storeInfo.detail}`);
@@ -2843,4 +2930,5 @@ app.listen(PORT, () => {
   setInterval(() => { refreshMetaTokens().catch(console.error); }, 24 * 60 * 60 * 1000).unref?.();
   // İmleçleri kaybetmemek için düzenli olarak diske yaz.
   setInterval(saveState, 5 * 60 * 1000).unref?.();
+  setInterval(pruneDedupe, 10 * 60 * 1000).unref?.();
 });
