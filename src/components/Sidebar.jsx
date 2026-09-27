@@ -1,11 +1,14 @@
 import React from 'react';
-import { Radio, Repeat, Activity, ShieldCheck } from 'lucide-react';
+import { Radio, Repeat, Activity, ShieldCheck, Globe } from 'lucide-react';
 
 export default function Sidebar({ activeTab, setActiveTab }) {
   const menuItems = [
     { id: 'accounts', label: '🔌 Bağlantılar', desc: 'Telegram & Twitter', icon: Radio },
     { id: 'rules',    label: '⚡ Oto-Sync Kuralları', desc: 'Kanal -> Tweet Eşleştirme', icon: Repeat },
     { id: 'logs',     label: '📜 Canlı Akış Logları', desc: 'Anlık İşlem Günlüğü', icon: Activity },
+    { id: 'retweets', label: '🔄 Retweet Ağı', desc: 'Karşılıklı RT', icon: Repeat },
+    { id: 'scheduled',label: '🕒 Zamanlanmış Tweet', desc: 'İleri Tarihli', icon: Radio },
+    { id: 'proxies',  label: '🌐 Proxy Yönetimi', desc: 'Mobil IP & Güvenlik', icon: Globe },
   ];
 
   return (

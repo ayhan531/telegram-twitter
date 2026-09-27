@@ -92,7 +92,7 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
   const igAccounts = metaAccounts.filter(a => a.platform === 'instagram');
   const fbAccounts = metaAccounts.filter(a => a.platform === 'facebook');
 
-  const [form, setForm] = useState(initial || {
+  const [form, setForm] = useState({
     title: 'Yeni Paylaşım Kuralı',
     sourcePlatform: 'telegram',
     sourceAccountId: telegramAccounts[0]?.credentials?.accountId || telegramAccounts[0]?.id || '',
@@ -104,9 +104,14 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
     skipReplies: true,
     replyMode: 'everyone',
     targets: [],
-    autoHashtags: '',
+    hashtags: [],
+    hashtagInput: '',
+    sendMedia: true,
+    staticMediaBase64: null,
+    staticMediaType: null,
     bannedKeywords: '',
     enabled: true,
+    ...(initial || {})
   });
 
   const [preview, setPreview] = useState(null);
@@ -435,9 +440,58 @@ function RuleForm({ accounts, initial, onSave, onCancel }) {
       </div>
 
       <div>
-        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">🏷️ Otomatik Hashtag (İsteğe Bağlı)</label>
-        <input type="text" value={form.autoHashtags} onChange={e => set('autoHashtags', e.target.value)}
-          placeholder="#kripto, #gündem, #telegram"
+        <label className="text-[11px] font-bold text-slate-300 block mb-1">Medya Ayarları</label>
+        <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-700 space-y-3">
+          <label className="flex items-center gap-2 text-xs text-slate-300">
+            <input type="checkbox" checked={form.sendMedia} onChange={e => set('sendMedia', e.target.checked)} />
+            Medyayı da gönder (orijinal mesajdaki fotoğraf/videoları ekle)
+          </label>
+          <div className="pt-2 border-t border-slate-700/50">
+            <label className="text-[11px] font-bold text-slate-400 block mb-1">Sabit görsel ekle (Tüm tweetlere aynı görsel eklenir)</label>
+            <input type="file" accept="image/*" onChange={e => {
+              const file = e.target.files[0];
+              if (file) {
+                const reader = new FileReader();
+                reader.onload = ev => {
+                  setForm(p => ({ ...p, staticMediaBase64: ev.target.result, staticMediaType: file.type }));
+                };
+                reader.readAsDataURL(file);
+              } else {
+                setForm(p => ({ ...p, staticMediaBase64: null, staticMediaType: null }));
+              }
+            }} className="text-[10px] text-slate-400 file:mr-3 file:py-1 file:px-2 file:rounded-lg file:border-0 file:text-[10px] file:bg-slate-700 file:text-slate-300" />
+            {form.staticMediaBase64 && (
+              <div className="mt-2 relative inline-block">
+                <img src={form.staticMediaBase64} alt="Sabit Görsel" className="h-16 rounded border border-slate-600" />
+                <button type="button" onClick={() => setForm(p => ({ ...p, staticMediaBase64: null, staticMediaType: null }))} className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 rounded-full flex items-center justify-center text-white text-[10px]">✕</button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <label className="text-[11px] font-bold text-slate-300 block mb-0.5">🏷️ Otomatik Hashtagler</label>
+        <div className="flex flex-wrap gap-1 mb-2">
+          {(form.hashtags || []).map((tag, i) => (
+            <span key={i} className="px-2 py-1 rounded bg-indigo-900/60 text-indigo-200 text-[10px] flex items-center gap-1">
+              #{tag}
+              <button type="button" onClick={() => set('hashtags', form.hashtags.filter(x => x !== tag))} className="text-rose-400 hover:text-rose-300">✕</button>
+            </span>
+          ))}
+        </div>
+        <input type="text" value={form.hashtagInput || ''}
+          onChange={e => set('hashtagInput', e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === ',') {
+              e.preventDefault();
+              const val = (form.hashtagInput || '').trim().replace(/^#/, '');
+              if (val && (!form.hashtags || form.hashtags.length < 10) && !(form.hashtags || []).includes(val)) {
+                setForm(p => ({ ...p, hashtags: [...(p.hashtags || []), val], hashtagInput: '' }));
+              }
+            }
+          }}
+          placeholder="#bitcoin #crypto #btc"
           className="w-full px-3 py-2 rounded-xl glass-input text-white text-xs" />
       </div>
 
@@ -646,9 +700,9 @@ export default function SyncRules({ accounts, rules, setRules, onShowToast }) {
 
                   {/* Filters */}
                   <div className="flex items-center flex-wrap gap-2 mt-3">
-                    {rule.autoHashtags && (
+                    {rule.hashtags && rule.hashtags.length > 0 && (
                       <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                        🏷️ {rule.autoHashtags}
+                        🏷️ {rule.hashtags.map(h => `#${h}`).join(' ')}
                       </span>
                     )}
                     {rule.bannedKeywords && (

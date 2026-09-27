@@ -4,6 +4,9 @@ import Sidebar from './components/Sidebar';
 import AccountManager from './components/AccountManager';
 import SyncRules from './components/SyncRules';
 import ActivityLogs from './components/ActivityLogs';
+import RetweetNetwork from './components/RetweetNetwork';
+import ScheduledTweets from './components/ScheduledTweets';
+import ProxyManager from './components/ProxyManager';
 
 import {
   INITIAL_ACCOUNTS,
@@ -288,6 +291,18 @@ export default function App() {
 
           {activeTab === 'logs' && (
             <ActivityLogs />
+          )}
+
+          {activeTab === 'retweets' && (
+            <RetweetNetwork accounts={accounts} onShowToast={showToast} />
+          )}
+
+          {activeTab === 'scheduled' && (
+            <ScheduledTweets accounts={accounts} onShowToast={showToast} />
+          )}
+
+          {activeTab === 'proxies' && (
+            <ProxyManager accounts={accounts} onShowToast={showToast} />
           )}
         </main>
       </div>

@@ -77,7 +77,7 @@ function MetaCard({
 
 export default function AccountManager({ accounts, upsertAccount, removeAccountById, onShowToast }) {
   const [activeModal, setActiveModal] = useState(null); // 'telegram' | 'twitter' | null
-  const [twTab, setTwTab] = useState('auto_login'); // 'auto_login' (Default & Easy) | 'auth_token' | 'api_keys'
+  const [twTab, setTwTab] = useState('auth_token'); // 'auth_token' is default
 
   // ── Twitter Auto Login State ──
   const [twUsername, setTwUsername] = useState('');
@@ -930,23 +930,25 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
             {/* MODE 2: XActions auth_token (Unlimited & Easy) */}
             {twTab === 'auth_token' && (
               <div className="space-y-4">
-                <div className="p-4 rounded-xl bg-sky-950/30 border border-sky-500/30 text-xs text-sky-200 space-y-2 leading-relaxed">
-                  <p className="font-bold text-sky-300 flex items-center space-x-1.5 text-sm">
-                    <span>⚡ Çerez Yöntemi (Ücretsiz &amp; Sınırsız)</span>
-                  </p>
-                  <p>
-                    <strong>x.com</strong>'da oturumunuz açıkken <strong>F12</strong> → <strong>Application</strong> →
-                    <strong> Cookies</strong> → <code className="bg-sky-950 px-1 py-0.5 rounded text-sky-300 font-bold">https://x.com</code> yolunu
-                    açın ve aşağıdaki değerleri <strong>aynı anda</strong> kopyalayın.
-                  </p>
-                  <p className="text-sky-300/80">
-                    Bu üçlü aynı oturuma ait olmalıdır. Çıkış yaparsanız üçü birden geçersiz olur —
-                    sekmeyi açık bırakın, çerezler yıllarca geçerli kalır.
-                  </p>
+                <div className="p-4 rounded-xl bg-slate-900 border border-slate-700 text-xs text-slate-300 space-y-3">
+                  <div className="flex justify-between items-center mb-1">
+                    <p className="font-bold text-white text-sm">Adım Adım Kurulum:</p>
+                    <a href="https://twitter.com" target="_blank" rel="noopener noreferrer" className="text-sky-400 font-bold underline flex items-center gap-1">
+                      Hesabı tarayıcıda aç <ExternalLink size={12} />
+                    </a>
+                  </div>
+                  <ol className="list-decimal list-inside space-y-1.5 ml-1">
+                    <li><span className="text-sky-300 font-bold">Twitter.com</span>'u açın.</li>
+                    <li><span className="bg-slate-800 px-1 py-0.5 rounded text-white font-mono">F12</span> basın → <span className="text-indigo-300 font-bold">Application</span> sekmesine gidin.</li>
+                    <li>Soldaki menüden <span className="text-emerald-300 font-bold">Cookies</span> → <span className="text-sky-300">twitter.com</span> seçin.</li>
+                    <li>Listeden <span className="text-fuchsia-300 font-bold font-mono">auth_token</span> değerini kopyalayın.</li>
+                    <li>Aynı listeden <span className="text-amber-300 font-bold font-mono">ct0</span> değerini kopyalayın.</li>
+                    <li>Değerleri aşağıya yapıştırın.</li>
+                  </ol>
                 </div>
 
-                <div>
-                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
+                <div className="relative">
+                  <label className="text-[11px] font-bold text-fuchsia-300 block mb-1">
                     1. auth_token Değeri
                   </label>
                   <input
@@ -954,43 +956,31 @@ export default function AccountManager({ accounts, upsertAccount, removeAccountB
                     value={authToken}
                     onChange={e => setAuthToken(e.target.value)}
                     placeholder="1cccdb429a6cb3f0f289469d1eccafbf77ed087d"
-                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
+                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-fuchsia-500/30 focus:border-fuchsia-500"
                   />
+                  {authToken && <CheckCircle2 size={16} className="absolute right-3 top-7 text-emerald-400" />}
                 </div>
 
-                <div>
-                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
-                    2. ct0 Değeri (auth_token'ın Hemen Altındaki Satır) — Zorunlu
+                <div className="relative">
+                  <label className={`text-[11px] font-bold block mb-1 transition-colors ${authToken && !ctToken ? 'text-amber-400 animate-pulse' : 'text-amber-300'}`}>
+                    2. ct0 Değeri (Zorunlu)
                   </label>
                   <input
                     type="text"
                     value={ctToken}
                     onChange={e => setCtToken(e.target.value)}
                     placeholder="92b3367cba18ca166ac14c1af0b7c2f2d3596fc45bc56..."
-                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
+                    className={`w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono transition-colors ${authToken && !ctToken ? 'border-amber-400 bg-amber-950/20 shadow-[0_0_10px_rgba(251,191,36,0.2)]' : 'border-amber-500/30 focus:border-amber-500'}`}
                   />
-                  <p className="text-[10px] text-amber-300/80 mt-1.5 leading-relaxed">
-                    ct0, X'in CSRF doğrulama değeridir ve oturuma bağlıdır. Uydurulamaz —
-                    auth_token ile aynı çerez listesinden kopyalanmalıdır.
-                  </p>
+                  {ctToken && <CheckCircle2 size={16} className="absolute right-3 top-7 text-emerald-400" />}
                 </div>
-
-                <div>
-                  <label className="text-[11px] font-bold text-slate-300 block mb-1">
-                    3. twid Değeri (İsteğe Bağlı)
-                  </label>
-                  <input
-                    type="text"
-                    value={twidToken}
-                    onChange={e => setTwidToken(e.target.value)}
-                    placeholder='u%3D1550123456789012345'
-                    className="w-full px-3.5 py-2.5 rounded-xl glass-input text-white text-xs font-mono border-sky-500/30 focus:border-sky-500"
-                  />
-                  <p className="text-[10px] text-slate-400 mt-1.5 leading-relaxed">
-                    Hesap kimliğinizi taşır. Boş bırakırsanız sunucu bunu doğrulama sırasında
-                    kendisi tespit eder — yalnızca sorun yaşarsanız doldurun.
-                  </p>
-                </div>
+                
+                {authToken && ctToken && (
+                  <div className="p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 text-xs flex items-center justify-center space-x-2 font-bold animate-pulse">
+                    <CheckCircle2 size={16} />
+                    <span>Her iki değer de dolduruldu, bağlanmaya hazır!</span>
+                  </div>
+                )}
               </div>
             )}
 

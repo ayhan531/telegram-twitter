@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
 import crypto from 'crypto';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import fs from 'fs';
 import { createStore } from './storage.js';
 import {
@@ -152,6 +153,9 @@ const accountsStore    = new Map(); // accountId -> arayüzün gördüğü hesap
 const tempMedia        = new Map(); // token -> { buffer, mediaType, expiresAt }
 const tgActiveSessions = new Map(); // accountId -> { client, sessionString, accountName, apiId, apiHash }
 const syncRulesStore   = new Map(); // ruleId -> rule object
+const retweetRulesStore = new Map();
+const scheduledTweetsStore = new Map();
+const proxyStore = new Map();
 // Aynı mesajın iki kez paylaşılmasını engeller.
 //
 // Telegram bağlantı koptuğunda kaçırılan güncellemeleri yeniden gönderiyor
@@ -232,6 +236,9 @@ function collectState() {
     // Yeniden başlatmadan sonra Telegram kaçırılan mesajları tekrar gönderir;
     // bu liste olmadan hepsi yeniden paylaşılırdı.
     handled: [...recentlySynced.entries()].filter(([, until]) => until > Date.now()),
+    retweetRules: [...retweetRulesStore.values()],
+    scheduledTweets: [...scheduledTweetsStore.values()],
+    proxies: [...proxyStore.values()],
     savedAt: new Date().toISOString(),
   };
 }
@@ -266,7 +273,7 @@ function saveState() {
   }, 2000);
 }
 
-const EMPTY_STATE = { sessions: [], rules: [], cursors: {}, meta: [], accounts: [], settings: {}, handled: [] };
+const EMPTY_STATE = { sessions: [], rules: [], cursors: {}, meta: [], accounts: [], settings: {}, handled: [], retweetRules: [], scheduledTweets: [], proxies: [] };
 
 async function loadState() {
   if (!store) return { ...EMPTY_STATE };
@@ -278,6 +285,9 @@ async function loadState() {
       cursors: parsed.cursors || {}, meta: parsed.meta || [],
       accounts: parsed.accounts || [], settings: parsed.settings || {},
       handled: parsed.handled || [],
+      retweetRules: parsed.retweetRules || [],
+      scheduledTweets: parsed.scheduledTweets || [],
+      proxies: parsed.proxies || [],
     };
   } catch (e) {
     console.error('[Depolama] Yüklenemedi:', e.message);
@@ -1349,8 +1359,9 @@ function applyRefreshedCookies(cookieMap) {
 
 // Oturumu doğrular. X, v1.1 verify_credentials'ı kapattığı için giriş yapılmış
 // ana sayfayı okuyup içindeki hesap bilgisine bakıyoruz.
-async function fetchHomePage(cookieMap) {
-  const r = await fetch('https://x.com/home', {
+async function fetchHomePage(cookieMap, accountId) {
+  const agent = accountId ? getProxyForAccount(accountId) : undefined;
+  const r = await fetch('https://x.com/home', { agent,
     headers: { cookie: cookieHeaderOf(cookieMap), 'User-Agent': BROWSER_UA },
   });
   absorbSetCookies(r, cookieMap);
@@ -1358,7 +1369,7 @@ async function fetchHomePage(cookieMap) {
   return { status: r.status, html };
 }
 
-async function verifyTwitterCookies(cookieMap) {
+async function verifyTwitterCookies(cookieMap, accountId) {
   if (!cookieMap.get('auth_token')) {
     return { error: 'Çerezlerde auth_token yok. Hesabı yeniden bağlayın.' };
   }
@@ -1368,7 +1379,7 @@ async function verifyTwitterCookies(cookieMap) {
 
   let page;
   try {
-    page = await fetchHomePage(cookieMap);
+    page = await fetchHomePage(cookieMap, accountId);
   } catch (e) {
     return { error: 'X\'e ulaşılamadı: ' + e.message };
   }
@@ -1395,7 +1406,7 @@ const FALLBACK_NOTE_QUERY_ID = 'WCcsCWTsiPteFwUxjI6OmA';
 const opCaches = new Map(); // operasyon adı -> { op, fetchedAt }
 
 // Operasyon tanımını X'in kendi web paketinden okur (sorgu kimliği + feature).
-async function discoverOp(cookieMap, opName = 'CreateTweet', force = false) {
+async function discoverOp(cookieMap, opName = 'CreateTweet', force = false, accountId) {
   const cached = opCaches.get(opName);
   if (!force && cached && Date.now() - cached.fetchedAt < OP_CACHE_MS) {
     return cached.op;
@@ -1406,11 +1417,12 @@ async function discoverOp(cookieMap, opName = 'CreateTweet', force = false) {
     : FALLBACK_OP;
 
   try {
-    const { html } = await fetchHomePage(cookieMap);
+    const { html } = await fetchHomePage(cookieMap, accountId);
     const bundle = /https:\/\/abs\.twimg\.com\/responsive-web\/client-web\/main\.[0-9a-f]+\.js/.exec(html)?.[0];
     if (!bundle) throw new Error('main paketi bulunamadı');
 
-    const js = await (await fetch(bundle, { headers: { 'User-Agent': BROWSER_UA } })).text();
+    const agent = accountId ? getProxyForAccount(accountId) : undefined;
+      const js = await (await fetch(bundle, { headers: { 'User-Agent': BROWSER_UA }, agent })).text();
     const marker = `operationName:"${opName}"`;
     const idx = js.indexOf(marker);
     if (idx < 0) throw new Error(`${opName} tanımı bulunamadı`);
@@ -1456,6 +1468,7 @@ function mediaCategoryFor(mediaType) {
 async function uploadCall(cookieMap, params, body) {
   const txId = await clientTransactionId('POST', '/i/media/upload.json');
   const r = await fetch(`${UPLOAD_URL}?${new URLSearchParams(params)}`, {
+    agent: accountId ? getProxyForAccount(accountId) : undefined,
     method: 'POST',
     headers: apiHeaders(cookieMap, {
       referer: 'https://x.com',
@@ -1517,111 +1530,58 @@ const REPLY_MODES = {
   verified:  'Verified',     // Onaylanmış hesaplar
 };
 
-async function createTweetRequest(cookieMap, op, text, mediaIds, replyMode = 'everyone', opName = 'CreateTweet') {
+
+async function callGraphQl(cookieMap, op, opName, variables, isGet = false, accountId = undefined) {
   const pathname = `/i/api/graphql/${op.queryId}/${opName}`;
-  const txId = await clientTransactionId('POST', pathname);
-  const variables = {
-    tweet_text: text || '',
-    dark_request: false,
-    media: {
-      media_entities: mediaIds.map(id => ({ media_id: id, tagged_users: [] })),
-      possibly_sensitive: false,
-    },
-    semantic_annotation_ids: [],
-    disallowed_reply_options: null,
-  };
+  const method = isGet ? 'GET' : 'POST';
+  const txId = await clientTransactionId(method, pathname);
+  
+  const features = {};
+  for (const f of op.featureSwitches || []) features[f] = true;
+  for (const f of op.fieldToggles || []) features[f] = true;
 
-  const controlMode = REPLY_MODES[replyMode];
-  if (controlMode) variables.conversation_control = { mode: controlMode };
+  features.responsive_web_graphql_exclude_directive_enabled = true;
+  features.verified_phone_label_enabled = false;
+  features.creator_subscriptions_tweet_preview_api_enabled = true;
+  features.responsive_web_graphql_timeline_navigation_enabled = true;
+  features.responsive_web_graphql_skip_user_profile_image_extensions_enabled = false;
+  features.tweetypie_unmention_optimization_enabled = true;
+  features.responsive_web_edit_tweet_api_enabled = true;
+  features.graphql_is_translatable_rweb_tweet_is_translatable_enabled = true;
+  features.view_counts_everywhere_api_enabled = true;
+  features.longform_notetweets_consumption_enabled = true;
+  features.responsive_web_twitter_article_tweet_consumption_enabled = true;
+  features.tweet_awards_web_tipping_enabled = false;
+  features.freedom_of_speech_not_reach_fetch_enabled = true;
+  features.standardized_nudges_misinfo = true;
+  features.tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled = true;
+  features.longform_notetweets_rich_text_read_enabled = true;
+  features.longform_notetweets_inline_media_enabled = true;
+  features.responsive_web_media_download_video_enabled = false;
+  features.responsive_web_enhance_cards_enabled = false;
 
-  const r = await fetch(`https://x.com${pathname}`, {
-    method: 'POST',
-    headers: apiHeaders(cookieMap, {
-      'content-type': 'application/json',
-      ...(txId ? { 'x-client-transaction-id': txId } : {}),
-    }),
-    body: JSON.stringify({
-      variables,
-      features: Object.fromEntries(op.featureSwitches.map(n => [n, true])),
-      fieldToggles: Object.fromEntries(op.fieldToggles.map(n => [n, false])),
-      queryId: op.queryId,
-    }),
-  });
-
-  absorbSetCookies(r, cookieMap);
-  const body = await r.text();
-  let data = null;
-  try { data = JSON.parse(body); } catch (_) {}
-  return { status: r.status, data, body };
-}
-
-// ─── Gönderim Kuyruğu ───────────────────────────────────────────────────────
-// X, art arda hızlı gelen gönderimleri (özellikle veri merkezi IP'lerinden)
-// spam sayıp HTTP 200 ile birlikte BOŞ tweet_results döndürerek sessizce düşürür.
-// Hata mesajı vermez. Bu yüzden gönderimleri tek sıraya alıp aralarında en az
-// SEND_MIN_GAP_MS bekliyor, sessizce düşen tweet'i artan aralıklarla yeniden
-// deniyoruz. Telegram akışı yoğunlaşsa bile bağlantı kopmuyor.
-const SEND_MIN_GAP_MS = 30 * 1000;
-const SOFT_DROP_RETRY_DELAYS = [90 * 1000, 240 * 1000];
-
-// Kuyruk HESAP BAŞINA tutuluyor. Tek bir global kuyruk, X'in sınırı hesap
-// bazlı olmasına rağmen bütün hesapları birbirini beklettiriyordu: 10 hesaba
-// 10 tweet atmak 5 dakika sürüyordu. Artık farklı hesaplar aynı anda gönderiyor,
-// aynı hesabın gönderileri arasında ise 30 sn korunuyor.
-const sendQueues = new Map(); // hesap anahtarı -> { chain, lastSendAt }
-
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-function enqueueSend(task, accountKey = 'default') {
-  let q = sendQueues.get(accountKey);
-  if (!q) {
-    q = { chain: Promise.resolve(), lastSendAt: 0 };
-    sendQueues.set(accountKey, q);
+  let url = `https://x.com${pathname}`;
+  let body = undefined;
+  
+  if (isGet) {
+     const params = new URLSearchParams({ variables: JSON.stringify(variables), features: JSON.stringify(features) });
+     url += '?' + params.toString();
+  } else {
+     body = JSON.stringify({ variables, features, queryId: op.queryId });
   }
 
-  const queued = q.chain.then(async () => {
-    const wait = q.lastSendAt + SEND_MIN_GAP_MS - Date.now();
-    if (wait > 0) {
-      console.log(`[Twitter] ${accountKey}: X hız sınırına takılmamak için ${Math.ceil(wait / 1000)} sn bekleniyor.`);
-      await sleep(wait);
-    }
-    try {
-      return await task();
-    } finally {
-      q.lastSendAt = Date.now();
-    }
-  });
-  q.chain = queued.then(() => {}, () => {});
-  return queued;
+  const h = apiHeaders(cookieMap, isGet ? {} : { 'content-type': 'application/json' }, txId);
+  const agent = accountId ? getProxyForAccount(accountId) : undefined;
+  const r = await fetch(url, { method, headers: h, body, agent });
+  
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch(e) {}
+  
+  return { status: r.status, data };
 }
 
-async function attemptCreateTweet(cookieMap, text, mediaIds, replyMode, longText = false) {
-  // 280'i aşan gönderiler normal uçtan reddedilir; Premium hesaplarda
-  // CreateNoteTweet kullanmak gerekiyor.
-  const opName = (longText && (text || '').length > 280) ? NOTE_TWEET_OP : 'CreateTweet';
-
-  let op = await discoverOp(cookieMap, opName);
-  let res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode, opName);
-
-  // Sorgu kimliği eskimişse X 404 döner; kimliği tazeleyip bir kez daha deniyoruz.
-  if (res.status === 404) {
-    console.warn(`[Twitter] ${opName} sorgu kimliği eskimiş, yeniden keşfediliyor...`);
-    op = await discoverOp(cookieMap, opName, true);
-    res = await createTweetRequest(cookieMap, op, text, mediaIds, replyMode, opName);
-  }
-
-  // Uzun gönderi reddedilirse sessizce kaybetmek yerine kısaltıp gönderiyoruz.
-  if (opName === NOTE_TWEET_OP && res.status >= 400) {
-    console.warn('[Twitter] Uzun gönderi reddedildi, 280 karaktere kısaltılıp yeniden deneniyor.');
-    const short = fitText(text, 280);
-    const normalOp = await discoverOp(cookieMap, 'CreateTweet');
-    res = await createTweetRequest(cookieMap, normalOp, short, mediaIds, replyMode, 'CreateTweet');
-    res.truncatedFallback = true;
-  }
-  return res;
-}
-
-async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'everyone', longText = false) {
+async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'everyone', longText = false, accountId = undefined) {
   const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
   if (!cookieMap.get('auth_token') || !cookieMap.get('ct0')) {
     return { success: false, error: 'Çerezler eksik (auth_token ve ct0 gerekli). Hesabı yeniden bağlayın.' };
@@ -1639,13 +1599,13 @@ async function postTweetViaCookies(cookies, text, mediaData = [], replyMode = 'e
       const mediaIds = [];
       for (const item of mediaData.slice(0, 4)) { // X en fazla 4 medya kabul eder
         const buf = Buffer.isBuffer(item.data) ? item.data : Buffer.from(item.data);
-        const id = await uploadMediaToTwitter(cookieMap, buf, item.mediaType);
+        const id = await uploadMediaToTwitter(cookieMap, buf, item.mediaType, accountId);
         mediaIds.push(id);
         console.log(`[Twitter] Medya yüklendi (${item.mediaType}, ${(buf.length / 1024).toFixed(0)} KB), id: ${id}`);
       }
 
       for (let attempt = 0; ; attempt++) {
-        const res = await attemptCreateTweet(cookieMap, text, mediaIds, replyMode, longText);
+        const res = await attemptCreateTweet(cookieMap, text, mediaIds, replyMode, longText, accountId);
 
         // Yanıt anahtarı uca göre değişiyor: normal gönderide create_tweet,
         // uzun (Premium) gönderide notetweet_create. Yalnızca create_tweet'e
@@ -1698,7 +1658,7 @@ app.post('/api/twitter/send', async (req, res) => {
 
   // 1. If cookies provided -> Free & Unlimited post via scraper
   if (Array.isArray(cookies) && cookies.length > 0) {
-    const freeRes = await postTweetViaCookies(cookies, text);
+    const freeRes = await postTweetViaCookies(cookies, text, [], 'everyone', false, req.body.accountId);
     if (freeRes.success) return res.json({ success: true });
     return res.status(400).json({ success: false, error: freeRes.error });
   }
@@ -2433,8 +2393,7 @@ async function deliverToTarget(target, post, rule) {
       case 'twitter': {
         const c = resolveTwitterCredentials(target);
         if (Array.isArray(c.cookies) && c.cookies.length > 0) {
-          const r = await postTweetViaCookies(
-            c.cookies, post.text, post.media, opts.replyMode || rule.replyMode, !!opts.longText);
+          const r = await postTweetViaCookies(c.cookies, post.text, post.media, opts.replyMode || rule.replyMode, !!opts.longText, target.accountId);
           return { success: r.success, error: r.error };
         }
         if (c.consumerKey && c.consumerSecret) {
@@ -2444,6 +2403,7 @@ async function deliverToTarget(target, post, rule) {
           const url = 'https://api.twitter.com/2/tweets';
           const authHeader = buildOAuth1Header('POST', url, c.consumerKey, c.consumerSecret, c.accessToken, c.accessTokenSecret);
           const r = await fetch(url, {
+            agent: getProxyForAccount(target.accountId),
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: authHeader },
             body: JSON.stringify({ text: post.text }),
@@ -2807,12 +2767,263 @@ async function checkTwitterSessions() {
   }
 }
 
+
+function getProxyForAccount(accountId) {
+  for (const proxy of proxyStore.values()) {
+     if (proxy.enabled && proxy.assignedAccountIds && proxy.assignedAccountIds.includes(accountId)) {
+        const auth = (proxy.username && proxy.password) ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@` : '';
+        return new HttpsProxyAgent(`${proxy.protocol}://${auth}${proxy.host}:${proxy.port}`);
+     }
+  }
+  return undefined;
+}
+
 app.get('/api/twitter/health', (_req, res) => {
   res.json({
     success: true,
     accounts: [...twitterHealth.entries()].map(([name, h]) => ({ name, ...h })),
   });
 });
+
+
+// ==========================================
+// RETWEET NETWORK SYSTEM
+// ==========================================
+
+async function retweetViaCookies(cookies, tweetId, accountId = undefined) {
+  const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
+  if (!cookieMap.get('auth_token') || !cookieMap.get('ct0')) {
+    return { success: false, error: 'Eksik �erezler' };
+  }
+  const accountKey = cookieMap.get('auth_token').slice(-12);
+  return enqueueSend(async () => {
+    try {
+      const op = await discoverOp(cookieMap, 'CreateRetweet', false, accountId);
+      const res = await callGraphQl(cookieMap, op, 'CreateRetweet', { tweet_id: tweetId }, false, accountId);
+      if (res.status === 404) {
+         const newOp = await discoverOp(cookieMap, 'CreateRetweet', true, accountId);
+         const res2 = await callGraphQl(cookieMap, newOp, 'CreateRetweet', { tweet_id: tweetId }, false, accountId);
+         if (res2.status === 200) return { success: true };
+         return { success: false, error: 'Retweet basarisiz' };
+      }
+      if (res.status === 200) return { success: true };
+      return { success: false, error: 'Retweet basarisiz' };
+    } catch(e) {
+      return { success: false, error: e.message };
+    }
+  }, accountKey);
+}
+
+app.post('/api/twitter/retweet', authMiddleware, async (req, res) => {
+  const { retweeterCookies, tweetId, accountId } = req.body;
+  if (!retweeterCookies || !tweetId) return res.status(400).json({success:false});
+  const result = await retweetViaCookies(retweeterCookies, tweetId, accountId);
+  res.json(result);
+});
+
+app.post('/api/twitter/undo-retweet', authMiddleware, async (req, res) => {
+  const { cookies, tweetId, accountId } = req.body;
+  if (!cookies || !tweetId) return res.status(400).json({success:false});
+  const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
+  try {
+    const op = await discoverOp(cookieMap, 'DeleteRetweet', false, accountId);
+    await callGraphQl(cookieMap, op, 'DeleteRetweet', { source_tweet_id: tweetId }, false, accountId);
+    res.json({success: true});
+  } catch(e) { res.json({success: false, error: e.message}); }
+});
+
+app.post('/api/twitter/like', authMiddleware, async (req, res) => {
+  const { cookies, tweetId, accountId } = req.body;
+  if (!cookies || !tweetId) return res.status(400).json({success:false});
+  const cookieMap = applyRefreshedCookies(parseCookieMap(cookies));
+  try {
+    const op = await discoverOp(cookieMap, 'FavoriteTweet', false, accountId);
+    await callGraphQl(cookieMap, op, 'FavoriteTweet', { tweet_id: tweetId }, false, accountId);
+    res.json({success: true});
+  } catch(e) { res.json({success: false, error: e.message}); }
+});
+
+app.get('/api/twitter/latest-tweets', authMiddleware, async (req, res) => {
+  const { handle, count } = req.query;
+  const targetHandle = handle.replace(/^@/, '').toLowerCase();
+  
+  const reader = [...accountsStore.values()].find(a => a.platform === 'twitter' && isUsableTwitterCredential(a.credentials));
+  if (!reader) return res.status(400).json({success:false, error:'No reader account'});
+  const cookieMap = applyRefreshedCookies(parseCookieMap(reader.credentials.cookies));
+  try {
+    const userOp = await discoverOp(cookieMap, 'UserByScreenName', false, reader.id);
+    const userRes = await callGraphQl(cookieMap, userOp, 'UserByScreenName', { screen_name: targetHandle }, false, reader.id);
+    const restId = userRes.data?.data?.user?.result?.rest_id;
+    if (!restId) return res.status(404).json({success:false, error:'User not found'});
+    
+    const tlOp = await discoverOp(cookieMap, 'UserTweets', false, reader.id);
+    const tlRes = await callGraphQl(cookieMap, tlOp, 'UserTweets', { userId: restId, count: Number(count) || 10, includePromotedContent: false, withQuickPromoteEligibilityTweetFields: true, withVoice: true, withV2Timeline: true }, false, reader.id);
+    
+    const tweets = [];
+    const instructions = tlRes.data?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
+    for (const inst of instructions) {
+      if (inst.type === 'TimelineAddEntries') {
+         for (const entry of inst.entries || []) {
+           const result = entry.content?.itemContent?.tweet_results?.result;
+           if (result && result.rest_id) {
+             const text = result.legacy?.full_text || '';
+             tweets.push({ id: result.rest_id, text });
+           }
+         }
+      }
+    }
+    res.json({success:true, tweets});
+  } catch(e) { res.status(500).json({success:false, error:e.message}); }
+});
+
+app.post('/api/retweet-rules', authMiddleware, (req, res) => {
+  const id = crypto.randomUUID();
+  const rule = { ...req.body, id };
+  retweetRulesStore.set(id, rule);
+  saveState();
+  res.json({success:true, rule});
+});
+
+app.get('/api/retweet-rules', authMiddleware, (req, res) => res.json({success:true, rules: [...retweetRulesStore.values()]}));
+
+app.delete('/api/retweet-rules/:id', authMiddleware, (req, res) => {
+  retweetRulesStore.delete(req.params.id);
+  saveState();
+  res.json({success:true});
+});
+
+app.put('/api/retweet-rules/:id', authMiddleware, (req, res) => {
+  const id = req.params.id;
+  if (!retweetRulesStore.has(id)) return res.status(404).json({success:false});
+  const updated = { ...retweetRulesStore.get(id), ...req.body, id };
+  retweetRulesStore.set(id, updated);
+  saveState();
+  res.json({success:true, rule: updated});
+});
+
+const retweetedIds = new Map();
+async function retweetWorker() {
+  for (const rule of retweetRulesStore.values()) {
+    if (!rule.enabled) continue;
+    const sourceAcc = accountsStore.get(rule.sourceAccountId);
+    if (!sourceAcc) continue;
+    
+    const handle = (sourceAcc.username || sourceAcc.name).replace(/^@/, '');
+    const reader = [...accountsStore.values()].find(a => a.platform === 'twitter' && isUsableTwitterCredential(a.credentials));
+    if (!reader) continue;
+    const cookieMap = applyRefreshedCookies(parseCookieMap(reader.credentials.cookies));
+    
+    try {
+      const userOp = await discoverOp(cookieMap, 'UserByScreenName', false, reader.id);
+      const userRes = await callGraphQl(cookieMap, userOp, 'UserByScreenName', { screen_name: handle }, false, reader.id);
+      const restId = userRes.data?.data?.user?.result?.rest_id;
+      if (!restId) continue;
+      
+      const tlOp = await discoverOp(cookieMap, 'UserTweets', false, reader.id);
+      const tlRes = await callGraphQl(cookieMap, tlOp, 'UserTweets', { userId: restId, count: 10, includePromotedContent: false, withQuickPromoteEligibilityTweetFields: true, withVoice: true, withV2Timeline: true }, false, reader.id);
+      
+      let set = retweetedIds.get(rule.id);
+      if (!set) { set = new Set(); retweetedIds.set(rule.id, set); }
+      
+      const instructions = tlRes.data?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
+      const tweets = [];
+      for (const inst of instructions) {
+        if (inst.type === 'TimelineAddEntries') {
+           for (const entry of inst.entries || []) {
+             const result = entry.content?.itemContent?.tweet_results?.result;
+             if (result && result.rest_id) tweets.push(result.rest_id);
+           }
+        }
+      }
+      
+      for (const tid of tweets) {
+        if (!set.has(tid)) {
+          set.add(tid);
+          if (set.size > 1000) set.delete(set.values().next().value);
+          setTimeout(async () => {
+             for (const rId of rule.retweeterAccountIds || []) {
+                const retweeterAcc = accountsStore.get(rId);
+                if (retweeterAcc && isUsableTwitterCredential(retweeterAcc.credentials)) {
+                   await retweetViaCookies(retweeterAcc.credentials.cookies, tid, rId);
+                }
+             }
+          }, (rule.delayMinutes || 5) * 60000);
+        }
+      }
+    } catch(e) {}
+  }
+}
+
+// ==========================================
+// SCHEDULED TWEET SYSTEM
+// ==========================================
+
+app.post('/api/scheduled-tweets', authMiddleware, (req, res) => {
+  const id = crypto.randomUUID();
+  const st = { ...req.body, id, lastRunAt: null, status: 'pending' };
+  scheduledTweetsStore.set(id, st);
+  saveState();
+  res.json({success:true, scheduledTweet: st});
+});
+
+app.get('/api/scheduled-tweets', authMiddleware, (req, res) => res.json({success:true, scheduledTweets: [...scheduledTweetsStore.values()]}));
+
+app.put('/api/scheduled-tweets/:id', authMiddleware, (req, res) => {
+  const id = req.params.id;
+  if (!scheduledTweetsStore.has(id)) return res.status(404).json({success:false});
+  const updated = { ...scheduledTweetsStore.get(id), ...req.body, id };
+  scheduledTweetsStore.set(id, updated);
+  saveState();
+  res.json({success:true, scheduledTweet: updated});
+});
+
+app.delete('/api/scheduled-tweets/:id', authMiddleware, (req, res) => {
+  scheduledTweetsStore.delete(req.params.id);
+  saveState();
+  res.json({success:true});
+});
+
+async function scheduledTweetWorker() {
+  const now = Date.now();
+  const d = new Date();
+  const hm = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  
+  for (const st of scheduledTweetsStore.values()) {
+    if (!st.enabled) continue;
+    let shouldFire = false;
+    
+    if (st.scheduleMode === 'once') {
+       if (st.status === 'pending' && st.scheduledAt && now >= new Date(st.scheduledAt).getTime()) shouldFire = true;
+    } else if (st.scheduleMode === 'daily') {
+       if (st.times && st.times.includes(hm) && (!st.lastRunAt || (now - st.lastRunAt > 60000))) shouldFire = true;
+    } else if (st.scheduleMode === 'interval') {
+       if (!st.lastRunAt || (now - st.lastRunAt >= (st.intervalMinutes || 60) * 60000)) shouldFire = true;
+    }
+    
+    if (shouldFire) {
+       st.lastRunAt = now;
+       st.status = 'sent';
+       saveState(); 
+       
+       const acc = accountsStore.get(st.accountId);
+       if (acc && isUsableTwitterCredential(acc.credentials)) {
+          (async () => {
+             await sleep(Math.random() * 3000 + 1000);
+             let text = st.text || '';
+             if (st.hashtags && st.hashtags.length) text += '\n\n' + st.hashtags.join(' ');
+             let media = [];
+             if (st.mediaBase64 && st.mediaType) media.push({ data: Buffer.from(st.mediaBase64, 'base64'), mediaType: st.mediaType });
+             
+             const r = await postTweetViaCookies(acc.credentials.cookies, text, media, 'everyone', false, st.accountId);
+             if (!r.success) {
+                st.status = 'failed';
+                saveState();
+             }
+          })();
+       }
+    }
+  }
+}
 
 // Serve static build from dist folder
 // Varlık dosyalarının adında içerik özeti var, bu yüzden sonsuza kadar
@@ -2844,6 +3055,9 @@ store = await createStore({ databaseUrl: process.env.DATABASE_URL, dataDir: DATA
 storeInfo = store.describe();
 
 const saved = await loadState();
+for (const r of saved.retweetRules || []) retweetRulesStore.set(r.id, r);
+for (const s of saved.scheduledTweets || []) scheduledTweetsStore.set(s.id, s);
+for (const p of saved.proxies || []) proxyStore.set(p.id, p);
 for (const s of saved.sessions) {
   tgActiveSessions.set(s.accountId, { ...s, client: null });
 }
@@ -2929,6 +3143,12 @@ app.listen(PORT, () => {
   setTimeout(() => { refreshMetaTokens().catch(console.error); }, 45000);
   setInterval(() => { refreshMetaTokens().catch(console.error); }, 24 * 60 * 60 * 1000).unref?.();
   // İmleçleri kaybetmemek için düzenli olarak diske yaz.
-  setInterval(saveState, 5 * 60 * 1000).unref?.();
+  
+  setTimeout(() => { retweetWorker().catch(console.error); }, 15000);
+  setInterval(() => { retweetWorker().catch(console.error); }, 60 * 1000).unref?.();
+
+  setTimeout(() => { scheduledTweetWorker().catch(console.error); }, 25000);
+  setInterval(() => { scheduledTweetWorker().catch(console.error); }, 30 * 1000).unref?.();
+setInterval(saveState, 5 * 60 * 1000).unref?.();
   setInterval(pruneDedupe, 10 * 60 * 1000).unref?.();
 });
